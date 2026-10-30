@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+*.csv
+.venv/
+dist/
+build/
+*.spec
+
+# eigene Plugins mit firmeninternen PGNs nicht veröffentlichen:
+# pgn_plugins/*.py
+# !pgn_plugins/_example_proprietary.py
