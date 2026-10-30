@@ -27,6 +27,7 @@ COM-Port wählen, Bitrate 250 kbit/s (NMEA2000-Standard), Modus „Nur Lauschen�
 | `n2k_viewer.py` | GUI (Tkinter), Seeed-Protokoll, Fast-Packet-Zusammensetzung |
 | `n2k_pgns.py` | PGN-Definitionen und Decoder (ca. 60 PGNs), Plugin-Loader |
 | `pgn_plugins/` | eigene / proprietäre PGNs als Plugins |
+| `i18n.py`, `locales/` | Mehrsprachigkeit (`locales/<code>.json` je Sprache) |
 
 ## Eigene (proprietäre) PGNs hinzufügen
 
@@ -46,6 +47,21 @@ register(65350, "Meine Firma: Sensorwerte", manufacturer=999, fields=[
 
 Der Hersteller-Header (Bit 0–15) wird automatisch dekodiert, Nutzdaten beginnen bei Bit 16.
 Wiederholte Gruppen: `Repeat`; Sonderfälle: `@decoder`. Details im Kopf von `n2k_pgns.py`.
+
+## Sprachen / Languages
+
+Oberfläche **und** dekodierte Feldnamen/Werte gibt es auf Deutsch und Englisch. Die Sprache wählst du oben rechts
+im Viewer (Umschaltung sofort, wird gespeichert; erster Start: Systemsprache, sonst Englisch). Gespeichert werden
+auch Port, Bitrate und Modus in `%APPDATA%\n2k-viewer.json` (bzw. `~/n2k-viewer.json`).
+
+**Weitere Sprache hinzufügen** – ohne Programmierung:
+
+1. `locales/en.json` nach `locales/fr.json` kopieren (Dateiname = Sprachcode).
+2. `"__name__"` (Anzeigename, z. B. `"Français"`) und die Werte rechts übersetzen. Links steht immer der deutsche
+   Quelltext, nicht ändern. Fehlende Einträge erscheinen automatisch auf Deutsch.
+3. Viewer neu starten – die Sprache erscheint in der Auswahl. `python i18n.py fr` listet noch fehlende Texte.
+
+Plugins können eigene Texte mit `add_translations("en", {...})` übersetzen (Beispiel in `pgn_plugins/_example_proprietary.py`).
 
 ## Hinweise
 

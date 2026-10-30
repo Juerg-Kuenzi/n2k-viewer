@@ -8,6 +8,8 @@ Benötigt: pip install pyserial
 PGN-Dekodierung: n2k_pgns.py  |  eigene/proprietäre PGNs: Ordner pgn_plugins/
 """
 import csv
+import json
+import os
 import queue
 import struct
 import threading
@@ -18,7 +20,29 @@ from tkinter import ttk, filedialog, messagebox
 import serial
 import serial.tools.list_ports
 
+import i18n
 import n2k_pgns as pg
+from i18n import t as tr          # tr(): Text in die gewählte Sprache übersetzen (siehe i18n.py)
+
+# Einstellungen (Sprache, Port, Bitrate, Modus): %APPDATA%\n2k-viewer.json bzw. ~/n2k-viewer.json
+CONFIG_FILE = os.path.join(os.environ.get("APPDATA") or os.path.expanduser("~"), "n2k-viewer.json")
+
+
+def load_config():
+    try:
+        with open(CONFIG_FILE, encoding="utf-8") as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def save_config(cfg):
+    try:
+        with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, indent=2, ensure_ascii=False)
+    except OSError:
+        pass
 
 # --------------------------------------------------------------------------
 # Seeed USB-CAN Analyzer Protokoll
@@ -139,7 +163,11 @@ class App(tk.Tk):
 
     def __init__(self):
         super().__init__()
-        self.title("NMEA2000 Viewer – Seeed USB-CAN Analyzer")
+        self.cfg = load_config()
+        i18n.set_language(self.cfg.get("language") or i18n.detect_language())
+        self._tx_items = []           # übersetzbare Widget-Texte (für die Live-Umschaltung)
+        self.fps = 0.0
+        self.title(tr("NMEA2000 Viewer – Seeed USB-CAN Analyzer"))
         self.geometry("1250x700")
         self.ser = None
         self.thread = None
@@ -163,44 +191,101 @@ class App(tk.Tk):
         self.after(100, self.tick)
         self.protocol("WM_DELETE_WINDOW", self.on_close)
 
+    # ----- Übersetzung -----
+    def _tx(self, widget, src, opt="text"):
+        """Widget-Text setzen und für die Live-Umschaltung der Sprache merken."""
+        self._tx_items.append(("opt", widget, src, opt))
+        widget.config(**{opt: tr(src)})
+        return widget
+
+    def _hd(self, tree, col, src):
+        self._tx_items.append(("head", tree, col, src))
+        tree.heading(col, text=tr(src))
+
+    def _tab(self, nb, frame, src):
+        nb.add(frame, text=tr(src))
+        self._tx_items.append(("tab", nb, frame, src))
+
+    def apply_language(self):
+        self.title(tr("NMEA2000 Viewer – Seeed USB-CAN Analyzer"))
+        for kind, w, a, b in self._tx_items:
+            if kind == "opt":
+                w.config(**{b: tr(a)})
+            elif kind == "head":
+                w.heading(a, text=tr(b))
+            elif kind == "tab":
+                w.tab(a, text=tr(b))
+        idx = self.mode.current()
+        self.mode["values"] = [tr(k) for k in MODES]
+        self.mode.current(idx if isinstance(idx, int) and idx >= 0 else 0)
+        self.btn_conn.config(text=tr("Trennen") if self.running else tr("Verbinden"))
+        self.btn_pause.config(text=tr("Weiter") if self.paused else tr("Pause"))
+        for r in self.pgn_rows.values():
+            r["dirty"] = True
+        self.show_detail()
+        self.update_status()
+
+    def on_language(self, _event=None):
+        codes = [c for c, _n in i18n.languages()]
+        i = self.lang.current()
+        if isinstance(i, int) and 0 <= i < len(codes):
+            i18n.set_language(codes[i])
+            self.cfg["language"] = codes[i]
+            save_config(self.cfg)
+            self.apply_language()
+
+    def update_status(self):
+        state = tr("verbunden") if self.running else tr("nicht verbunden")
+        self.status.config(text=tr("{state} | Frames: {n} | {fps:.0f} Frames/s | PGN/SA-Kombinationen: {k} | Plugins: {p}").format(
+            state=state, n=self.total, fps=self.fps, k=len(self.pgn_rows),
+            p=sum(1 for _f, e in self.plugin_res if not e)))
+
     def _build(self):
         top = ttk.Frame(self, padding=6)
         top.pack(fill="x")
-        ttk.Label(top, text="COM-Port:").pack(side="left")
+        self._tx(ttk.Label(top), "COM-Port:").pack(side="left")
         self.port = ttk.Combobox(top, width=28, state="readonly")
         self.port.pack(side="left", padx=4)
         ttk.Button(top, text="⟳", width=3, command=self.refresh_ports).pack(side="left")
-        ttk.Label(top, text="  Bitrate:").pack(side="left")
+        self._tx(ttk.Label(top), "Bitrate:").pack(side="left", padx=(12, 0))
         self.bitrate = ttk.Combobox(top, width=8, state="readonly", values=["250000", "125000", "500000", "1000000"])
-        self.bitrate.set("250000")
+        self.bitrate.set(str(self.cfg.get("bitrate", "250000")))
         self.bitrate.pack(side="left", padx=4)
-        ttk.Label(top, text="  Modus:").pack(side="left")
-        self.mode = ttk.Combobox(top, width=24, state="readonly", values=list(MODES))
-        self.mode.current(0)
+        self._tx(ttk.Label(top), "Modus:").pack(side="left", padx=(12, 0))
+        self.mode = ttk.Combobox(top, width=24, state="readonly", values=[tr(k) for k in MODES])
+        mi = self.cfg.get("mode", 0)
+        self.mode.current(mi if isinstance(mi, int) and 0 <= mi < len(MODES) else 0)
         self.mode.pack(side="left", padx=4)
-        self.btn_conn = ttk.Button(top, text="Verbinden", command=self.toggle_conn)
+        self.btn_conn = ttk.Button(top, text=tr("Verbinden"), command=self.toggle_conn)
         self.btn_conn.pack(side="left", padx=8)
-        self.btn_pause = ttk.Button(top, text="Pause", command=self.toggle_pause)
+        self.btn_pause = ttk.Button(top, text=tr("Pause"), command=self.toggle_pause)
         self.btn_pause.pack(side="left")
-        ttk.Button(top, text="Leeren", command=self.clear).pack(side="left", padx=4)
-        ttk.Button(top, text="Log speichern (CSV)", command=self.save_log).pack(side="left")
-        ttk.Button(top, text="Plugins neu laden", command=self.reload_plugins).pack(side="left", padx=4)
+        self._tx(ttk.Button(top, command=self.clear), "Leeren").pack(side="left", padx=4)
+        self._tx(ttk.Button(top, command=self.save_log), "Log speichern (CSV)").pack(side="left")
+        self._tx(ttk.Button(top, command=self.reload_plugins), "Plugins neu laden").pack(side="left", padx=4)
+        # Sprachauswahl (rechts) – Sprachen werden aus locales/*.json erkannt
+        langs = i18n.languages()
+        self.lang = ttk.Combobox(top, width=12, state="readonly", values=[n for _c, n in langs])
+        self.lang.current([c for c, _n in langs].index(i18n.get_language()))
+        self.lang.bind("<<ComboboxSelected>>", self.on_language)
+        self.lang.pack(side="right")
+        self._tx(ttk.Label(top), "Sprache:").pack(side="right", padx=4)
 
         nb = ttk.Notebook(self)
         nb.pack(fill="both", expand=True, padx=6, pady=4)
 
         # PGN-Übersicht
         f1 = ttk.Frame(nb)
-        nb.add(f1, text="PGN-Übersicht")
+        self._tab(nb, f1, "PGN-Übersicht")
         pw = ttk.PanedWindow(f1, orient="vertical")
         pw.pack(fill="both", expand=True)
         upper = ttk.Frame(pw)
         pw.add(upper, weight=3)
         cols = ("sa", "pgn", "name", "count", "hz", "data", "dec")
         self.tv = ttk.Treeview(upper, columns=cols, show="headings", selectmode="browse")
-        for c, t, w in (("sa", "SA", 45), ("pgn", "PGN", 70), ("name", "Name", 200), ("count", "Anzahl", 70),
-                        ("hz", "Hz", 55), ("data", "Daten (hex)", 330), ("dec", "Dekodiert", 450)):
-            self.tv.heading(c, text=t)
+        for c, title, w in (("sa", "SA", 45), ("pgn", "PGN", 70), ("name", "Name", 200), ("count", "Anzahl", 70),
+                            ("hz", "Hz", 55), ("data", "Daten (hex)", 330), ("dec", "Dekodiert", 450)):
+            self._hd(self.tv, c, title)
             self.tv.column(c, width=w, anchor="w")
         sb = ttk.Scrollbar(upper, orient="vertical", command=self.tv.yview)
         self.tv.configure(yscrollcommand=sb.set)
@@ -215,8 +300,8 @@ class App(tk.Tk):
         dwrap = ttk.Frame(lower)
         dwrap.pack(fill="both", expand=True)
         self.detail = ttk.Treeview(dwrap, columns=("f", "v"), show="headings", selectmode="none")
-        self.detail.heading("f", text="Feld")
-        self.detail.heading("v", text="Wert")
+        self._hd(self.detail, "f", "Feld")
+        self._hd(self.detail, "v", "Wert")
         self.detail.column("f", width=240, anchor="w")
         self.detail.column("v", width=700, anchor="w")
         sb3 = ttk.Scrollbar(dwrap, orient="vertical", command=self.detail.yview)
@@ -227,28 +312,31 @@ class App(tk.Tk):
 
         # Trace
         f2 = ttk.Frame(nb)
-        nb.add(f2, text="Trace")
+        self._tab(nb, f2, "Trace")
         cols2 = ("t", "id", "prio", "pgn", "sa", "da", "name", "data")
         self.tr = ttk.Treeview(f2, columns=cols2, show="headings")
-        for c, t, w in (("t", "Zeit [s]", 80), ("id", "CAN-ID", 90), ("prio", "Prio", 40), ("pgn", "PGN", 70),
-                        ("sa", "SA", 45), ("da", "DA", 45), ("name", "Name", 220), ("data", "Daten (hex)", 400)):
-            self.tr.heading(c, text=t)
+        for c, title, w in (("t", "Zeit [s]", 80), ("id", "CAN-ID", 90), ("prio", "Prio", 40), ("pgn", "PGN", 70),
+                            ("sa", "SA", 45), ("da", "DA", 45), ("name", "Name", 220), ("data", "Daten (hex)", 400)):
+            self._hd(self.tr, c, title)
             self.tr.column(c, width=w, anchor="w")
         sb2 = ttk.Scrollbar(f2, orient="vertical", command=self.tr.yview)
         self.tr.configure(yscrollcommand=sb2.set)
         self.tr.pack(side="left", fill="both", expand=True)
         sb2.pack(side="right", fill="y")
 
-        self.status = ttk.Label(self, text="Nicht verbunden", relief="sunken", anchor="w")
+        self.status = ttk.Label(self, relief="sunken", anchor="w")
         self.status.pack(fill="x", side="bottom")
+        self.update_status()
 
     # ----- Verbindung -----
     def refresh_ports(self):
         ports = [f"{p.device} – {p.description}" for p in serial.tools.list_ports.comports()]
         self.port["values"] = ports
         if ports and not self.port.get():
-            # CH340 bevorzugen
-            idx = next((i for i, p in enumerate(ports) if "CH340" in p.upper() or "USB-SERIAL" in p.upper()), 0)
+            want = self.cfg.get("port")      # zuletzt benutzter Port, sonst CH340 bevorzugen
+            idx = next((i for i, p in enumerate(ports) if want and p.split(" – ")[0] == want), None)
+            if idx is None:
+                idx = next((i for i, p in enumerate(ports) if "CH340" in p.upper() or "USB-SERIAL" in p.upper()), 0)
             self.port.current(idx)
 
     def toggle_conn(self):
@@ -259,15 +347,15 @@ class App(tk.Tk):
 
     def connect(self):
         if not self.port.get():
-            messagebox.showwarning("Port", "Bitte einen COM-Port wählen.")
+            messagebox.showwarning(tr("Port"), tr("Bitte einen COM-Port wählen."))
             return
         dev = self.port.get().split(" – ")[0]
         try:
             self.ser = serial.Serial(dev, 2000000, timeout=0.05)
-            self.ser.write(build_config(int(self.bitrate.get()), MODES[self.mode.get()]))
+            self.ser.write(build_config(int(self.bitrate.get()), MODES[list(MODES)[max(0, self.mode.current())]]))
             self.ser.flush()
         except Exception as e:
-            messagebox.showerror("Fehler", f"Verbindung fehlgeschlagen:\n{e}")
+            messagebox.showerror(tr("Fehler"), tr("Verbindung fehlgeschlagen:\n{e}").format(e=e))
             self.ser = None
             return
         self.parser = FrameParser()
@@ -275,7 +363,9 @@ class App(tk.Tk):
         self.t0 = time.time()
         self.thread = threading.Thread(target=self.reader, daemon=True)
         self.thread.start()
-        self.btn_conn.config(text="Trennen")
+        self.btn_conn.config(text=tr("Trennen"))
+        self.cfg.update(port=dev, bitrate=self.bitrate.get(), mode=max(0, self.mode.current()))
+        save_config(self.cfg)
 
     def disconnect(self):
         self.running = False
@@ -287,7 +377,7 @@ class App(tk.Tk):
             except Exception:
                 pass
         self.ser = None
-        self.btn_conn.config(text="Verbinden")
+        self.btn_conn.config(text=tr("Verbinden"))
 
     def reader(self):
         while self.running:
@@ -305,7 +395,7 @@ class App(tk.Tk):
     # ----- Verarbeitung -----
     def toggle_pause(self):
         self.paused = not self.paused
-        self.btn_pause.config(text="Weiter" if self.paused else "Pause")
+        self.btn_pause.config(text=tr("Weiter") if self.paused else tr("Pause"))
 
     def clear(self):
         self.tv.delete(*self.tv.get_children())
@@ -360,7 +450,7 @@ class App(tk.Tk):
                 if item[0] == "frame":
                     self.handle_frame(item[1], item[2])
                 elif item[0] == "error":
-                    messagebox.showerror("Serieller Fehler", item[1])
+                    messagebox.showerror(tr("Serieller Fehler"), item[1])
                     self.disconnect()
         except queue.Empty:
             pass
@@ -385,8 +475,8 @@ class App(tk.Tk):
         if now - self.last_tick >= 1.0:
             fps = (self.total - self.last_total) / (now - self.last_tick)
             self.last_total, self.last_tick = self.total, now
-            state = "verbunden" if self.running else "nicht verbunden"
-            self.status.config(text=f"{state} | Frames: {self.total} | {fps:.0f} Frames/s | PGN/SA-Kombinationen: {len(self.pgn_rows)} | Plugins: {sum(1 for _f, e in self.plugin_res if not e)}")
+            self.fps = fps
+            self.update_status()
         self.after(100, self.tick)
 
     def on_select(self, _event=None):
@@ -399,12 +489,13 @@ class App(tk.Tk):
         r = self.pgn_rows.get(self.sel_key) if self.sel_key else None
         if r is None or "full" not in r:
             self.detail.delete(*self.detail.get_children())
-            self.detail_title.config(text="Zeile in der Liste wählen, um alle dekodierten Felder zu sehen")
+            self.detail_title.config(text=tr("Zeile in der Liste wählen, um alle dekodierten Felder zu sehen"))
             return
         sa, pgn = self.sel_key
         full = r["full"]
-        rows = pg.decode_fields(pgn, full) or [("(keine Felddefinition)", "siehe pgn_plugins/_example_proprietary.py")]
-        self.detail_title.config(text=f"PGN {pgn} – {pg.pgn_name(pgn, full) or 'unbekannt'}   (SA {sa}, {len(full)} Bytes)")
+        rows = pg.decode_fields(pgn, full) or [(tr("(keine Felddefinition)"), tr("siehe pgn_plugins/_example_proprietary.py"))]
+        self.detail_title.config(text=tr("PGN {pgn} – {name}   (SA {sa}, {n} Bytes)").format(
+            pgn=pgn, name=pg.pgn_name(pgn, full) or tr("unbekannt"), sa=sa, n=len(full)))
         iids = self.detail.get_children()
         if len(iids) != len(rows):
             self.detail.delete(*iids)
@@ -417,7 +508,7 @@ class App(tk.Tk):
     def show_plugin_errors(self):
         errs = ["{}: {}".format(f, e) for f, e in self.plugin_res if e]
         if errs:
-            messagebox.showwarning("Plugin-Fehler", "\n".join(errs))
+            messagebox.showwarning(tr("Plugin-Fehler"), "\n".join(errs))
 
     def reload_plugins(self):
         self.plugin_res = pg.load_plugins()
@@ -425,12 +516,12 @@ class App(tk.Tk):
             r["dirty"] = True
         self.show_plugin_errors()
         if not any(e for _f, e in self.plugin_res):
-            messagebox.showinfo("Plugins", "{} Plugin(s) geladen.\n(Entfernte Plugins wirken erst nach einem Neustart.)"
-                                .format(len(self.plugin_res)))
+            messagebox.showinfo(tr("Plugins"), tr("{n} Plugin(s) geladen.\n(Entfernte Plugins wirken erst nach einem Neustart.)")
+                                .format(n=len(self.plugin_res)))
 
     def save_log(self):
         if not self.log:
-            messagebox.showinfo("Log", "Noch keine Daten.")
+            messagebox.showinfo(tr("Log"), tr("Noch keine Daten."))
             return
         fn = filedialog.asksaveasfilename(defaultextension=".csv", filetypes=[("CSV", "*.csv")],
                                           initialfile=time.strftime("n2k_%Y%m%d_%H%M%S.csv"))
@@ -438,12 +529,13 @@ class App(tk.Tk):
             return
         with open(fn, "w", newline="", encoding="utf-8") as f:
             w = csv.writer(f, delimiter=";")
-            w.writerow(["Zeit_s", "CAN_ID", "Prio", "PGN", "SA", "DA", "Name", "Daten_hex"])
+            w.writerow([tr(h) for h in ("Zeit_s", "CAN_ID", "Prio", "PGN", "SA", "DA", "Name", "Daten_hex")])
             for t, cid, prio, pgn, sa, da, d in self.log:
                 w.writerow([f"{t:.4f}", f"{cid:08X}", prio, pgn, sa, da, pg.pgn_name(pgn, d), d.hex(" ").upper()])
-        messagebox.showinfo("Log", f"{len(self.log)} Frames gespeichert.")
+        messagebox.showinfo(tr("Log"), tr("{n} Frames gespeichert.").format(n=len(self.log)))
 
     def on_close(self):
+        save_config(self.cfg)
         self.disconnect()
         self.destroy()
 
