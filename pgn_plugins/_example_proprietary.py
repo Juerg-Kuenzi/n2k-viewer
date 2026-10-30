@@ -8,6 +8,7 @@ Dateien in diesem Ordner, die NICHT mit "_" beginnen, werden beim Start (und üb
 Die Beispiele unten sind erfundene Demo-Formate – Hersteller-ID 9999 existiert nicht.
 """
 from n2k_pgns import register, decoder, F, Repeat, MANUFACTURERS, RAD2DEG
+from i18n import add_translations
 
 # Eigene Hersteller-ID bekannt machen (11 Bit, 0..2046)
 MANUFACTURERS[999] = "Meine Firma"
@@ -36,3 +37,15 @@ register(130900, "Meine Firma: Kanalliste", manufacturer=999, fast=True, fields=
 def _cmd(data):
     return [("Befehl", "0x{:02X}".format(data[2])),
             ("Nutzdaten", data[3:].hex(" ").upper(), True)]
+
+
+# 4) Übersetzungen (optional): deutscher Text -> Text in der Zielsprache. Feldnamen, Aufzählungswerte und
+#    PGN-Namen werden automatisch übersetzt; Texte ohne Eintrag bleiben unverändert. Du kannst Plugins
+#    auch gleich englisch benennen und brauchst dann keinen Eintrag.
+add_translations("en", {
+    "Meine Firma: Sensorwerte": "My company: sensor values",
+    "Meine Firma: Kanalliste": "My company: channel list",
+    "Meine Firma: Befehl": "My company: command",
+    "Temperatur": "Temperature", "Warnung": "Warning", "Kanal": "Channel", "Nr": "No.",
+    "Befehl": "Command", "Nutzdaten": "Payload",
+})

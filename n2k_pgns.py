@@ -2,6 +2,9 @@
 n2k_pgns.py – PGN-Dekoder-Modul für den NMEA2000 Viewer
 =========================================================
 
+Übersetzung: Feldnamen, Aufzählungswerte und PGN-Namen laufen automatisch durch i18n.t()
+(siehe i18n.py, locales/*.json); Texte ohne Übersetzung bleiben unverändert.
+
 Eigene (z. B. proprietäre) PGNs hinzufügen
 ------------------------------------------
 Lege im Ordner ``pgn_plugins/`` neben diesem Modul eine ``.py``-Datei an
@@ -56,6 +59,8 @@ import datetime
 import importlib.util
 import os
 
+from i18n import t
+
 RAD2DEG = 57.29577951308232
 MS2KN = 1.943844492440605
 
@@ -86,7 +91,7 @@ INDUSTRY = {0: "Global", 1: "Highway", 2: "Agriculture", 3: "Construction", 4: "
 
 
 def mfr_name(code):
-    return "{} ({})".format(MANUFACTURERS.get(code, "unbekannt"), code)
+    return "{} ({})".format(MANUFACTURERS.get(code, t("unbekannt")), code)
 
 
 # --------------------------------------------------------------------------
@@ -131,7 +136,7 @@ class F:
             raw -= 1 << L
         k = self.kind
         if k == "enum":
-            return self.enum.get(raw, "?({})".format(raw))
+            return t(self.enum.get(raw, "?({})".format(raw)))
         if k == "hex":
             return "0x{:0{}X}".format(raw, (L + 3) // 4)
         if k == "mfr":
@@ -173,8 +178,8 @@ class Repeat:
             for f in self.fields:
                 v = f.value(data, base)
                 if v is not None:
-                    parts.append("{}={}".format(f.name, v))
-            out.append(("{}[{}]".format(self.name, i + 1), ", ".join(parts), False))
+                    parts.append("{}={}".format(t(f.name), v))
+            out.append(("{}[{}]".format(t(self.name), i + 1), ", ".join(parts), False))
         return out
 
 
@@ -194,15 +199,15 @@ class PgnDef:
             for f in _HDR:
                 v = f.value(data)
                 if v is not None:
-                    out.append((f.name, v, f.hidden))
+                    out.append((t(f.name), v, f.hidden))
         if self.func:
             r = self.func(data)
             if isinstance(r, str):
                 r = [("Info", r)]
             elif isinstance(r, dict):
                 r = list(r.items())
-            for t in r or []:
-                out.append((t[0], str(t[1]), t[2] if len(t) > 2 else False))
+            for item in r or []:
+                out.append((t(item[0]), t(str(item[1])), item[2] if len(item) > 2 else False))
             return out
         for f in self.fields:
             if isinstance(f, Repeat):
@@ -210,7 +215,7 @@ class PgnDef:
             else:
                 v = f.value(data)
                 if v is not None:
-                    out.append((f.name, v, f.hidden))
+                    out.append((t(f.name), v, f.hidden))
         return out
 
 
@@ -278,11 +283,11 @@ def is_fast_packet(pgn):
 def pgn_name(pgn, data=None):
     d = _find(pgn, data)
     if d:
-        return d.name
+        return t(d.name)
     if is_proprietary(pgn):
         if data is not None and len(data) >= 2:
-            return "Proprietär: " + MANUFACTURERS.get(_mfr_of(data), "Hersteller {}".format(_mfr_of(data)))
-        return "Proprietär"
+            return t("Proprietär") + ": " + MANUFACTURERS.get(_mfr_of(data), t("Hersteller {}").format(_mfr_of(data)))
+        return t("Proprietär")
     return ""
 
 
@@ -293,11 +298,11 @@ def decode_fields(pgn, data):
         if d:
             return [(n, v) for n, v, _h in d.fields_out(data)]
         if is_proprietary(pgn) and len(data) >= 2:
-            out = [(f.name, f.value(data)) for f in _HDR]
-            out.append(("Daten", data[2:].hex(" ").upper()))
+            out = [(t(f.name), f.value(data)) for f in _HDR]
+            out.append((t("Daten"), data[2:].hex(" ").upper()))
             return out
     except Exception as e:  # fehlerhafte Plugins dürfen den Viewer nicht abstürzen lassen
-        return [("Dekodierfehler", "{}: {}".format(type(e).__name__, e))]
+        return [(t("Dekodierfehler"), "{}: {}".format(type(e).__name__, e))]
     return []
 
 
@@ -308,9 +313,9 @@ def decode(pgn, data):
         if d:
             return "  ".join(("{}={}".format(n, v) if n else v) for n, v, h in d.fields_out(data) if not h)
         if is_proprietary(pgn) and len(data) >= 2:
-            return "Hersteller {}  Daten {}".format(mfr_name(_mfr_of(data)), data[2:].hex(" ").upper())
+            return t("Hersteller {}  Daten {}").format(mfr_name(_mfr_of(data)), data[2:].hex(" ").upper())
     except Exception as e:
-        return "Dekodierfehler: {}: {}".format(type(e).__name__, e)
+        return t("Dekodierfehler: {}: {}").format(type(e).__name__, e)
     return ""
 
 
@@ -427,8 +432,8 @@ def _switch_bank(d):
         return []
     bits = int.from_bytes(d[1:], "little")
     n = min(28, (len(d) - 1) * 4)
-    st = ["Aus", "Ein", "Fehler", "n/a"]
-    return [("Bank", str(d[0])), ("Kanäle", " ".join("{}:{}".format(i + 1, st[(bits >> (2 * i)) & 3]) for i in range(n)))]
+    st = [t("Aus"), t("Ein"), t("Fehler"), "n/a"]
+    return [(t("Bank"), str(d[0])), (t("Kanäle"), " ".join("{}:{}".format(i + 1, st[(bits >> (2 * i)) & 3]) for i in range(n)))]
 
 
 # --------------------------------------------------------------------------
@@ -561,13 +566,13 @@ register(129039, "AIS Class B Position Report", fast=True, fields=_AIS_HDR + [
     _lat(72), _lon(40), _ang("COG", 112), _spd("SOG", 128), _ang("Heading", 168)])
 register(129794, "AIS Class A Static and Voyage Data", fast=True, fields=_AIS_HDR + [
     F("IMO", 40, 32), F("Rufzeichen", 72, 56, kind="str"), F("Name", 128, 160, kind="str"),
-    F("Schiffstyp", 288, 8), F("Länge", 296, 16, scale=0.1, unit="m", fmt="{:.1f}"),
-    F("Breite", 312, 16, scale=0.1, unit="m", fmt="{:.1f}"),
+    F("Schiffstyp", 288, 8), F("Schiffslänge", 296, 16, scale=0.1, unit="m", fmt="{:.1f}"),
+    F("Schiffsbreite", 312, 16, scale=0.1, unit="m", fmt="{:.1f}"),
     F("Tiefgang", 408, 16, scale=0.01, unit="m"), F("Ziel", 424, 160, kind="str")])
 register(129809, "AIS Class B CS Static Data, Part A", fast=True, fields=_AIS_HDR + [F("Name", 40, 160, kind="str")])
 register(129810, "AIS Class B CS Static Data, Part B", fast=True, fields=_AIS_HDR + [
     F("Schiffstyp", 40, 8), F("Hersteller-ID", 48, 56, kind="str"), F("Rufzeichen", 104, 56, kind="str"),
-    F("Länge", 160, 16, scale=0.1, unit="m", fmt="{:.1f}"), F("Breite", 176, 16, scale=0.1, unit="m", fmt="{:.1f}")])
+    F("Schiffslänge", 160, 16, scale=0.1, unit="m", fmt="{:.1f}"), F("Schiffsbreite", 176, 16, scale=0.1, unit="m", fmt="{:.1f}")])
 
 register(130306, "Wind Data", [
     _sid(), _spd("Geschw.", 8), _ang("Winkel", 24),
