@@ -8,9 +8,11 @@ Benötigt: pip install pyserial
 PGN-Dekodierung: n2k_pgns.py  |  eigene/proprietäre PGNs: Ordner pgn_plugins/
 """
 import csv
+import datetime
 import json
 import os
 import queue
+import re
 import struct
 import threading
 import time
@@ -187,6 +189,57 @@ def split_id(can_id):
     return prio, pgn, sa, da
 
 
+def fmt_wall(w):
+    """PC-Zeit (Epoche) → '2026-10-31 12:12:05.123456' (lokale Zeit, Mikrosekunden)."""
+    return datetime.datetime.fromtimestamp(w).strftime("%Y-%m-%d %H:%M:%S.%f")
+
+
+def parse_wall(text):
+    return datetime.datetime.strptime(text.strip(), "%Y-%m-%d %H:%M:%S.%f").timestamp()
+
+
+_WALL_RE = re.compile(r"^\d{4}-\d\d-\d\d \d\d:\d\d:\d\d")
+
+
+def read_log_csv(path):
+    """Liest eine vom Viewer geschriebene Log-CSV (neues Format mit PC_Zeit in Spalte 1 oder altes ohne).
+
+    Rückgabe: (Einträge, fehlerhafte_Zeilen). Eintrag = dict(t, wall, can_id, data, cat_text) – ``can_id`` ist None bei
+    Fehlerzeilen, dann steht in ``err`` der Text 'Kategorie: Text' sowie sa/pgn/da. Die Spaltenüberschriften sind
+    sprachabhängig und werden deshalb nicht ausgewertet, nur die Spaltenreihenfolge."""
+    out, bad = [], 0
+    with open(path, newline="", encoding="utf-8-sig") as f:
+        rows = list(csv.reader(f, delimiter=";"))
+    for r in rows[1:]:
+        if not r or not any(c.strip() for c in r):
+            continue
+        try:
+            off = 1 if _WALL_RE.match(r[0]) else 0
+            wall = parse_wall(r[0]) if off else None
+            r = r + [""] * (off + 9 - len(r))
+            e = {"t": float(r[off]), "wall": wall, "can_id": None, "data": b"", "err": None,
+                 "sa": None, "pgn": None, "da": None}
+            for key, col in (("pgn", off + 3), ("sa", off + 4), ("da", off + 5)):
+                e[key] = int(r[col]) if r[col].strip() else None
+            if r[off + 8].strip():
+                e["err"] = r[off + 8]
+            elif r[off + 1].strip():
+                e["can_id"] = int(r[off + 1], 16)
+                e["data"] = bytes.fromhex(r[off + 7])
+            else:
+                raise ValueError("leer")
+        except (ValueError, IndexError):
+            bad += 1
+            continue
+        out.append(e)
+    if out and any(e["wall"] is None for e in out):          # altes Format: PC-Zeit aus Dateizeit schätzen
+        base = os.path.getmtime(path) - out[-1]["t"]
+        for e in out:
+            if e["wall"] is None:
+                e["wall"] = base + e["t"]
+    return out, bad
+
+
 class FastPacket:
     """Setzt Fast-Packet-Nachrichten zusammen und meldet Fehler (Abholen mit take_errors()).
     Eine gestörte Nachricht wird nur einmal gemeldet, nicht einmal pro Folgeframe.
@@ -280,6 +333,14 @@ class App(tk.Tk):
         self.last_total = 0
         self.last_tick = time.time()
         self.t0 = time.time()
+        self.t0p = time.perf_counter()     # genauer Zeitgeber für Zeitstempel (time.time() ist unter Windows grob)
+        self.trace_max = self.TRACE_MAX
+        self.trace_iids = []               # Trace-Zeilen (parallel zum Treeview), für den Sprung von der Fehlerliste
+        self.err_trace = {}                # Fehlerzeile → Trace-Zeile, in der der Fehler auftrat
+        self.warm_t0 = 0.0                 # Zeit des ersten Frames (bei geladenem Log: dessen erster Zeitstempel)
+        self._replay = None
+        self.offline = False               # True = geladenes Log (kein Live-Betrieb)
+        self.load_floor = 0
         self.sel_key = None
         self.iid_key = {}             # Treeview-iid -> (sa, pgn)
         self.err = {k: 0 for k in ERR_CATS}   # Fehlerzähler je Kategorie
@@ -395,6 +456,7 @@ class App(tk.Tk):
         self.btn_pause.pack(side="left")
         self._tx(ttk.Button(top, command=self.clear), "Leeren").pack(side="left", padx=4)
         self._tx(ttk.Button(top, command=self.save_log), "Log speichern (CSV)").pack(side="left")
+        self._tx(ttk.Button(top, command=self.load_log), "Log laden…").pack(side="left", padx=(4, 0))
         self._tx(ttk.Button(top, command=self.reload_plugins), "Plugins neu laden").pack(side="left", padx=4)
         self._tx(ttk.Button(top, command=self.open_settings), "Einstellungen…").pack(side="left")
         # Sprachauswahl (rechts) – Sprachen werden aus locales/*.json erkannt
@@ -435,7 +497,7 @@ class App(tk.Tk):
                  "Log bei Stopp automatisch speichern").pack(side="left", padx=8)
         self._tx(ttk.Button(tb, command=self.choose_log_dir), "Log-Ordner…").pack(side="left")
 
-        nb = ttk.Notebook(self)
+        nb = self.nb = ttk.Notebook(self)
         nb.pack(fill="both", expand=True, padx=6, pady=4)
 
         # PGN-Übersicht
@@ -477,6 +539,7 @@ class App(tk.Tk):
         # Trace
         f2 = ttk.Frame(nb)
         self._tab(nb, f2, "Trace")
+        self.trace_tab = f2
         cols2 = ("t", "id", "prio", "pgn", "sa", "da", "name", "data")
         self.tr = ttk.Treeview(f2, columns=cols2, show="headings")
         for c, title, w in (("t", "Zeit [s]", 80), ("id", "CAN-ID", 90), ("prio", "Prio", 40), ("pgn", "PGN", 70),
@@ -499,6 +562,7 @@ class App(tk.Tk):
             self._hd(self.errtv, c, title)
             self.errtv.column(c, width=w, anchor="w")
         self.errtv.tag_configure("severe", foreground="#c62828")
+        self.errtv.bind("<Double-1>", self.goto_error)
         sb4 = ttk.Scrollbar(f3, orient="vertical", command=self.errtv.yview)
         self.errtv.configure(yscrollcommand=sb4.set)
         self.errtv.pack(side="left", fill="both", expand=True)
@@ -548,8 +612,15 @@ class App(tk.Tk):
         self.reset_errors()
         self.stop_at = None
         self.stop_msg = ""
+        if self.offline:
+            self.offline = False
+            self.clear()
+        self.load_floor = 0
+        self.warm_t0 = 0.0
+        self.trace_max = self.TRACE_MAX
         self.running = True
         self.t0 = time.time()
+        self.t0p = time.perf_counter()
         self.thread = threading.Thread(target=self.reader, daemon=True)
         self.thread.start()
         self.btn_conn.config(text=tr("Trennen"))
@@ -586,7 +657,7 @@ class App(tk.Tk):
                 self.q.put(("error", str(e)))
                 break
             if data:
-                t = time.time() - self.t0
+                t = time.perf_counter() - self.t0p
                 for f in self.parser.feed(data):
                     self.q.put(("frame", t, f))
                 for ev in self.parser.take_events():
@@ -604,6 +675,9 @@ class App(tk.Tk):
     def clear(self):
         self.tv.delete(*self.tv.get_children())
         self.tr.delete(*self.tr.get_children())
+        self._replay = None
+        self.trace_iids.clear()
+        self.err_trace.clear()
         self.pgn_rows.clear()
         self.iid_key.clear()
         self.sel_key = None
@@ -613,24 +687,25 @@ class App(tk.Tk):
         self.fp = FastPacket()
         self.reset_errors()
 
-    def handle_frame(self, t, frame):
+    def handle_frame(self, t, frame, wall=None, trace=True):
         can_id, ext, rtr, d = frame
         if not ext:
             self.add_error(t, "fmt", tr("Standard-Frame (11 Bit) ID 0x{id:03X} – kein NMEA2000").format(id=can_id))
             return
         prio, pgn, sa, da = split_id(can_id)
         self.total += 1
-        self._log_append((t, can_id, prio, pgn, sa, da, d, None))
+        self._log_append((t, can_id, prio, pgn, sa, da, d, None), wall)
         name = pg.pgn_name(pgn, None if pg.is_fast_packet(pgn) else d)
-        if not self.paused:
-            self.tr.insert("", "end", values=(f"{t:.3f}", f"{can_id:08X}", prio, pgn, sa, da, name, d.hex(" ").upper()))
+        if not self.paused and trace:
+            self.trace_iids.append(self.tr.insert("", "end", values=(
+                f"{t:.3f}", f"{can_id:08X}", prio, pgn, sa, da, name, d.hex(" ").upper())))
         # Daten der Anwendungsebene
         if pg.is_fast_packet(pgn):
             full = self.fp.feed(sa, pgn, d, da)
             for code, info in self.fp.take_errors():
-                if code == "orphan" and t < WARMUP_S:      # beim Verbinden mitten in einer Nachricht ist das normal
+                if code == "orphan" and t - self.warm_t0 < WARMUP_S:      # beim Verbinden mitten in einer Nachricht ist das normal
                     continue
-                self.add_error(t, "fp", tr(FP_ERRORS[code]).format(**info), sa, pgn, da)
+                self.add_error(t, "fp", tr(FP_ERRORS[code]).format(**info), sa, pgn, da, wall)
             if full is None:
                 return
         else:
@@ -638,7 +713,7 @@ class App(tk.Tk):
         if pgn == 59392 and len(full) >= 8 and full[0] in (1, 2, 3):      # ISO Acknowledgement: NAK / verweigert / belegt
             what = {1: "NAK", 2: "Zugriff verweigert", 3: "Adresse belegt"}[full[0]]
             self.add_error(t, "nak", tr("{what} für PGN {pgn} (Antwort an Adresse {da})").format(
-                what=tr(what), pgn=int.from_bytes(full[5:8], "little"), da=da), sa, pgn, da)
+                what=tr(what), pgn=int.from_bytes(full[5:8], "little"), da=da), sa, pgn, da, wall)
         r = self.pgn_rows.get((sa, pgn))
         if r is None:
             iid = self.tv.insert("", "end", values=(sa, pgn, name, 0, "", "", ""))
@@ -686,9 +761,11 @@ class App(tk.Tk):
             if sel_dirty:
                 self.show_detail()
             ch = self.tr.get_children()
-            if len(ch) > self.TRACE_MAX:
-                self.tr.delete(*ch[:len(ch) - self.TRACE_MAX])
-            if ch:
+            if len(ch) > self.trace_max:
+                k = len(ch) - self.trace_max
+                self.tr.delete(*ch[:k])
+                del self.trace_iids[:k]
+            if ch and not self.offline:
                 self.tr.see(self.tr.get_children()[-1])
         if self.stop_at is not None and time.time() >= self.stop_at:
             self.do_stop()
@@ -705,19 +782,21 @@ class App(tk.Tk):
         self.after(100, self.tick)
 
     # ----- Fehleranzeige -----
-    def add_error(self, t, cat, text, sa=None, pgn=None, da=None):
+    def add_error(self, t, cat, text, sa=None, pgn=None, da=None, wall=None, limit=True):
         """Fehler zählen, ins Log schreiben, (begrenzt) in die Fehlerliste eintragen und ggf. den Stopp auslösen."""
         self.err[cat] += 1
         now = time.time()
         self.err_last[cat] = now
-        self._log_append((t, None, None, pgn, sa, da, b"", (cat, text)))      # vollständig, ohne Mengenbegrenzung
+        self._log_append((t, None, None, pgn, sa, da, b"", (cat, text)), wall)      # vollständig, ohne Mengenbegrenzung
         if now - self.rate_t >= 1.0:
             self.rate_t, self.rate_n = now, 0
         self.rate_n += 1
-        if self.rate_n <= 20:                               # Fehlerliste nicht fluten, Zähler und Log bleiben exakt
-            self.errtv.insert("", "end", values=(f"{t:.3f}", tr(ERR_CATS[cat][0]), "" if sa is None else sa,
-                                                 "" if da is None else da, "" if pgn is None else pgn, text),
-                              tags=("severe" if ERR_CATS[cat][1] else "info",))
+        if not limit or self.rate_n <= 20:                               # Fehlerliste nicht fluten, Zähler und Log bleiben exakt
+            iid = self.errtv.insert("", "end", values=(f"{t:.3f}", tr(ERR_CATS[cat][0]), "" if sa is None else sa,
+                                                       "" if da is None else da, "" if pgn is None else pgn, text),
+                                    tags=("severe" if ERR_CATS[cat][1] else "info",))
+            if self.trace_iids:
+                self.err_trace[iid] = self.trace_iids[-1]
             ch = self.errtv.get_children()
             if len(ch) > self.ERR_MAX:
                 self.errtv.delete(*ch[:len(ch) - self.ERR_MAX])
@@ -726,11 +805,13 @@ class App(tk.Tk):
         if self.stop_on_error and self.running and self.stop_at is None and cat in self.trigger_cats:
             self.arm_stop(t, cat, text)
 
-    def _log_append(self, entry):
-        """Log = Ringpuffer: bei Überlauf fallen die ältesten Einträge weg (Vorlauf bleibt erhalten)."""
-        self.log.append(entry)
-        if len(self.log) > self.log_max:
-            del self.log[:max(1, self.log_max // 5)]
+    def _log_append(self, entry, wall=None):
+        """Log = Ringpuffer: bei Überlauf fallen die ältesten Einträge weg (Vorlauf bleibt erhalten).
+        Das 9. Element ist die PC-Zeit (Epoche) des Eintrags."""
+        self.log.append(entry + (self.t0 + entry[0] if wall is None else wall,))
+        cap = max(self.log_max, self.load_floor)
+        if len(self.log) > cap:
+            del self.log[:max(1, cap // 5)]
 
     # ----- Stopp bei Fehler -----
     def _build_trigger_menu(self):
@@ -1038,6 +1119,114 @@ class App(tk.Tk):
             messagebox.showinfo(tr("Plugins"), tr("{n} Plugin(s) geladen.\n(Entfernte Plugins wirken erst nach einem Neustart.)")
                                 .format(n=len(self.plugin_res)))
 
+    # ----- Log laden / Analyse -----
+    LOAD_TRACE_MAX = 100000       # so viele Frames zeigt der Trace bei einem geladenen Log (Fenster um den ersten Fehler)
+
+    @staticmethod
+    def _label_map():
+        """Kategorienamen aller Sprachen → interner Schlüssel (Logs können in einer anderen Sprache entstanden sein)."""
+        cur = i18n.get_language()
+        m = {}
+        for code, _n in i18n.languages():
+            i18n.set_language(code)
+            for k, label in CAT_LABELS.items():
+                m[tr(label)] = k
+        i18n.set_language(cur)
+        return m
+
+    def load_log(self):
+        fn = filedialog.askopenfilename(filetypes=[("CSV", "*.csv"), ("*", "*.*")], title=tr("Log laden…"))
+        if not fn:
+            return
+        if self.running:
+            if not messagebox.askyesno(tr("Log laden…"), tr("Die laufende Aufzeichnung wird beendet. Fortfahren?")):
+                return
+            self.disconnect()
+        try:
+            entries, bad = read_log_csv(fn)
+        except (OSError, UnicodeDecodeError, csv.Error) as e:
+            messagebox.showerror(tr("Fehler"), str(e))
+            return
+        if not entries:
+            messagebox.showerror(tr("Fehler"), tr("Keine gültigen Zeilen in der Datei."))
+            return
+        self.start_replay(entries, os.path.basename(fn), bad)
+
+    def start_replay(self, entries, name, bad=0):
+        self.clear()
+        self.offline = True
+        self.stop_at, self.stop_msg = None, ""
+        self.load_floor = len(entries)
+        self.warm_t0 = entries[0]["t"]
+        labels = self._label_map()
+        # Fenster für den Trace: bei sehr grossen Logs um den ersten Fehler herum
+        frame_idx = [i for i, e in enumerate(entries) if e["err"] is None]
+        first_err = next((i for i, e in enumerate(entries) if e["err"] is not None), None)
+        lo, hi = 0, len(entries)
+        if len(frame_idx) > self.LOAD_TRACE_MAX:
+            c = first_err if first_err is not None else len(entries)
+            lo, hi = max(0, c - self.LOAD_TRACE_MAX // 2), min(len(entries), c + self.LOAD_TRACE_MAX // 2)
+        self.trace_max = max(self.TRACE_MAX, self.LOAD_TRACE_MAX)
+        self._replay = dict(entries=entries, i=0, labels=labels, window=(lo, hi), name=name, bad=bad,
+                            nf=len(frame_idx), ne=0, skipped=0)
+        self._replay_step()
+
+    def _replay_step(self):
+        st = self._replay
+        if st is None:
+            return
+        entries, labels, (lo, hi) = st["entries"], st["labels"], st["window"]
+        end = min(len(entries), st["i"] + 2000)
+        for i in range(st["i"], end):
+            e = entries[i]
+            if e["err"] is None:
+                self.handle_frame(e["t"], (e["can_id"], True, False, e["data"]), e["wall"], trace=lo <= i < hi)
+                continue
+            label, _sep, text = e["err"].partition(": ")
+            cat = labels.get(label)
+            if cat in ("fp", "nak"):          # werden aus den Frames neu berechnet (aktuelle Logik)
+                continue
+            st["ne"] += 1
+            if cat == "trigger":
+                self._log_append((e["t"], None, None, e["pgn"], e["sa"], e["da"], b"", ("trigger", text)), e["wall"])
+            elif cat in ERR_CATS:
+                self.add_error(e["t"], cat, text, e["sa"], e["pgn"], e["da"], e["wall"], limit=False)
+            else:
+                st["skipped"] += 1
+        st["i"] = end
+        if end < len(entries):
+            self.stop_msg = tr("Log wird geladen … {p:.0f} %").format(p=100.0 * end / len(entries))
+            self.update_status()
+            self.after(1, self._replay_step)
+            return
+        self._replay = None
+        for key, r in self.pgn_rows.items():
+            r["dirty"] = True
+        self.stop_msg = tr("Log geladen: {name} – {f} Frames, {e} aufgezeichnete Fehler").format(
+            name=st["name"], f=st["nf"], e=st["ne"])
+        self.update_status()
+        self.update_errors()
+        if st["bad"] or st["skipped"]:
+            messagebox.showwarning(tr("Log laden…"), tr("{n} Zeilen konnten nicht gelesen werden.").format(
+                n=st["bad"] + st["skipped"]))
+        ch = self.errtv.get_children()
+        if ch:
+            self.errtv.selection_set(ch[0])
+            self.errtv.see(ch[0])
+            self.goto_error()
+
+    def goto_error(self, _event=None):
+        """Doppelklick in der Fehlerliste: im Trace zur betreffenden Zeile springen."""
+        sel = self.errtv.selection()
+        if not sel:
+            return
+        iid = self.err_trace.get(sel[0])
+        if iid is None or iid not in set(self.tr.get_children()):
+            return
+        self.nb.select(self.trace_tab)
+        self.tr.selection_set(iid)
+        self.tr.see(iid)
+
     def write_log(self, path):
         """Alle Frames und Fehlerereignisse in zeitlicher Reihenfolge als CSV. Fehlerzeilen haben Text in der
         Spalte 'Fehler' (Kategorie: Text); die Zeile 'Auslöser' markiert den automatischen Stopp."""
@@ -1045,15 +1234,15 @@ class App(tk.Tk):
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
         with open(path, "w", newline="", encoding="utf-8") as f:
             w = csv.writer(f, delimiter=";")
-            w.writerow([tr(h) for h in ("Zeit_s", "CAN_ID", "Prio", "PGN", "SA", "DA", "Name", "Daten_hex", "Fehler")])
-            for t, cid, prio, pgn, sa, da, d, err in self.log:
+            w.writerow([tr(h) for h in ("PC_Zeit", "Zeit_s", "CAN_ID", "Prio", "PGN", "SA", "DA", "Name", "Daten_hex", "Fehler")])
+            for t, cid, prio, pgn, sa, da, d, err, wall in self.log:
                 if err:
                     ne += 1
-                    w.writerow([f"{t:.4f}", "", "", "" if pgn is None else pgn, "" if sa is None else sa,
+                    w.writerow([fmt_wall(wall), f"{t:.4f}", "", "", "" if pgn is None else pgn, "" if sa is None else sa,
                                 "" if da is None else da, "", "", "{}: {}".format(tr(CAT_LABELS[err[0]]), err[1])])
                 else:
                     nf += 1
-                    w.writerow([f"{t:.4f}", f"{cid:08X}", prio, pgn, sa, da, pg.pgn_name(pgn, d), d.hex(" ").upper(), ""])
+                    w.writerow([fmt_wall(wall), f"{t:.4f}", f"{cid:08X}", prio, pgn, sa, da, pg.pgn_name(pgn, d), d.hex(" ").upper(), ""])
         return nf, ne
 
     def save_log(self):
@@ -1084,9 +1273,9 @@ class App(tk.Tk):
         try:
             with open(fn, "w", newline="", encoding="utf-8") as f:
                 w = csv.writer(f, delimiter=";")
-                w.writerow([tr(h) for h in ("Zeit_s", "Kategorie", "SA", "DA", "PGN", "Details")])
-                for t, _c, _p, pgn, sa, da, _d, err in rows:
-                    w.writerow([f"{t:.4f}", tr(CAT_LABELS[err[0]]), "" if sa is None else sa, "" if da is None else da,
+                w.writerow([tr(h) for h in ("PC_Zeit", "Zeit_s", "Kategorie", "SA", "DA", "PGN", "Details")])
+                for t, _c, _p, pgn, sa, da, _d, err, wall in rows:
+                    w.writerow([fmt_wall(wall), f"{t:.4f}", tr(CAT_LABELS[err[0]]), "" if sa is None else sa, "" if da is None else da,
                                 "" if pgn is None else pgn, err[1]])
         except OSError as e:
             messagebox.showerror(tr("Fehler"), str(e))
