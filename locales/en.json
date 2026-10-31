@@ -313,5 +313,13 @@
   "Log wird geladen … {p:.0f} %": "Loading log … {p:.0f} %",
   "Log geladen: {name} – {f} Frames, {e} aufgezeichnete Fehler": "Log loaded: {name} – {f} frames, {e} recorded errors",
   "{n} Zeilen konnten nicht gelesen werden.": "{n} rows could not be read.",
-  "Zeitstempel innerhalb eines Datenblocks schätzen (gleichmässig verteilt)": "Estimate timestamps within a data block (evenly distributed)"
+  "Zeitstempel innerhalb eines Datenblocks schätzen (gleichmässig verteilt)": "Estimate timestamps within a data block (evenly distributed)",
+  "Nachricht": "Message",
+  "(nicht dekodierbar)": "(cannot be decoded)",
+  "Nachricht unvollständig im Log ({why}) – es wird nur der gewählte Frame gezeigt.": "Message incomplete in the log ({why}) – only the selected frame is shown.",
+  "Startframe fehlt": "start frame missing",
+  "Folgeframe fehlt": "continuation frame missing",
+  "Startframe ungültig": "invalid start frame",
+  "nicht mehr im Log": "no longer in the log",
+  "kein Frame": "not a frame"
 }

@@ -254,6 +254,54 @@ def read_log_csv(path):
     return out, bad
 
 
+def assemble_fast(log, idx):
+    """Fast-Packet-Nachricht, zu der der Frame log[idx] gehört, aus dem Log zusammensetzen.
+
+    Rückgabe: (Daten, Hinweis). Daten sind None, wenn die Nachricht im Log unvollständig ist (Frame verloren oder
+    Log beginnt/endet mittendrin); Hinweis ist ein kurzer Text dafür. Zuordnung über (SA, DA, PGN, Sequenznummer)."""
+    e = log[idx]
+    key = (e[4], e[5], e[3])
+    d = e[6]
+    if not d or e[1] is None:
+        return None, "kein Frame"
+    seq = d[0] >> 5
+    def same(x):
+        return x[1] is not None and (x[4], x[5], x[3]) == key and x[6] and (x[6][0] >> 5) == seq
+    i = idx
+    if (d[0] & 0x1F) != 0:                        # rückwärts bis zum Startframe (Frame-Zähler 0)
+        want = (d[0] & 0x1F) - 1
+        j = idx - 1
+        while j >= 0 and want >= 0:
+            x = log[j]
+            if same(x):
+                if (x[6][0] & 0x1F) == want:
+                    want -= 1
+                    i = j
+                else:
+                    return None, "Startframe fehlt"
+            j -= 1
+        if want >= 0 or (log[i][6][0] & 0x1F) != 0:
+            return None, "Startframe fehlt"
+    start = log[i][6]
+    if len(start) < 2:
+        return None, "Startframe ungültig"
+    total = start[1]
+    data = bytearray(start[2:8])
+    fc = 1
+    j = i + 1
+    while len(data) < total and j < len(log):
+        x = log[j]
+        if same(x):
+            if (x[6][0] & 0x1F) != fc:
+                return None, "Folgeframe fehlt"
+            data += x[6][1:8]
+            fc += 1
+        j += 1
+    if len(data) < total:
+        return None, "Folgeframe fehlt"
+    return bytes(data[:total]), ""
+
+
 class FastPacket:
     """Setzt Fast-Packet-Nachrichten zusammen und meldet Fehler (Abholen mit take_errors()).
     Eine gestörte Nachricht wird nur einmal gemeldet, nicht einmal pro Folgeframe.
@@ -349,6 +397,8 @@ class App(tk.Tk):
         self.t0 = time.time()
         self.t0p = time.perf_counter()     # genauer Zeitgeber für Zeitstempel (time.time() ist unter Windows grob)
         self.trace_max = self.TRACE_MAX
+        self.trace_ref = {}                # Trace-Zeile → Log-Eintrag (für die Detailansicht per Doppelklick)
+        self.detail_win = None
         self.trace_iids = []               # Trace-Zeilen (parallel zum Treeview), für den Sprung von der Fehlerliste
         self.err_trace = {}                # Fehlerzeile → Trace-Zeile, in der der Fehler auftrat
         self.warm_t0 = 0.0                 # Zeit des ersten Frames (bei geladenem Log: dessen erster Zeitstempel)
@@ -564,6 +614,7 @@ class App(tk.Tk):
         sb2 = ttk.Scrollbar(f2, orient="vertical", command=self.tr.yview)
         self.tr.configure(yscrollcommand=sb2.set)
         self.tr.pack(side="left", fill="both", expand=True)
+        self.tr.bind("<Double-1>", self.show_frame_detail)
         sb2.pack(side="right", fill="y")
 
         # Fehlerliste
@@ -699,6 +750,7 @@ class App(tk.Tk):
         self.tr.delete(*self.tr.get_children())
         self._replay = None
         self.trace_iids.clear()
+        self.trace_ref.clear()
         self.err_trace.clear()
         self.pgn_rows.clear()
         self.iid_key.clear()
@@ -716,11 +768,13 @@ class App(tk.Tk):
             return
         prio, pgn, sa, da = split_id(can_id)
         self.total += 1
-        self._log_append((t, can_id, prio, pgn, sa, da, d, None), wall)
+        entry = self._log_append((t, can_id, prio, pgn, sa, da, d, None), wall)
         name = pg.pgn_name(pgn, None if pg.is_fast_packet(pgn) else d)
         if not self.paused and trace:
-            self.trace_iids.append(self.tr.insert("", "end", values=(
-                f"{t:.3f}", f"{can_id:08X}", prio, pgn, sa, da, name, d.hex(" ").upper())))
+            iid = self.tr.insert("", "end", values=(
+                f"{t:.3f}", f"{can_id:08X}", prio, pgn, sa, da, name, d.hex(" ").upper()))
+            self.trace_iids.append(iid)
+            self.trace_ref[iid] = entry
         # Daten der Anwendungsebene
         if pg.is_fast_packet(pgn):
             full = self.fp.feed(sa, pgn, d, da)
@@ -787,6 +841,8 @@ class App(tk.Tk):
                 k = len(ch) - self.trace_max
                 self.tr.delete(*ch[:k])
                 del self.trace_iids[:k]
+                for old in ch[:k]:
+                    self.trace_ref.pop(old, None)
             if ch and not self.offline:
                 self.tr.see(self.tr.get_children()[-1])
         if self.stop_at is not None and time.time() >= self.stop_at:
@@ -830,10 +886,12 @@ class App(tk.Tk):
     def _log_append(self, entry, wall=None):
         """Log = Ringpuffer: bei Überlauf fallen die ältesten Einträge weg (Vorlauf bleibt erhalten).
         Das 9. Element ist die PC-Zeit (Epoche) des Eintrags."""
-        self.log.append(entry + (self.t0 + entry[0] if wall is None else wall,))
+        entry = entry + (self.t0 + entry[0] if wall is None else wall,)
+        self.log.append(entry)
         cap = max(self.log_max, self.load_floor)
         if len(self.log) > cap:
             del self.log[:max(1, cap // 5)]
+        return entry
 
     # ----- Stopp bei Fehler -----
     def _build_trigger_menu(self):
@@ -1110,6 +1168,52 @@ class App(tk.Tk):
         sel = self.tv.selection()
         self.sel_key = self.iid_key.get(sel[0]) if sel else None
         self.show_detail()
+
+    def show_frame_detail(self, _event=None):
+        """Doppelklick im Trace: dekodierte Felder der Nachricht, zu der der Frame gehört (Fast-Packet: zusammengesetzt)."""
+        sel = self.tr.selection()
+        entry = self.trace_ref.get(sel[0]) if sel else None
+        if entry is None:
+            return
+        t, can_id, prio, pgn, sa, da, d, _err, wall = entry
+        note = ""
+        full = d
+        if pg.is_fast_packet(pgn):
+            idx = next((i for i in range(len(self.log) - 1, -1, -1) if self.log[i] is entry), None)
+            full, why = (None, "nicht mehr im Log") if idx is None else assemble_fast(self.log, idx)
+            if full is None:
+                note = tr("Nachricht unvollständig im Log ({why}) – es wird nur der gewählte Frame gezeigt.").format(why=tr(why))
+                full = d
+        rows = []
+        if not note or not pg.is_fast_packet(pgn):
+            rows = pg.decode_fields(pgn, full)
+        if not rows:
+            rows = [(tr("(keine Felddefinition)") if not note else tr("(nicht dekodierbar)"), "")]
+        head = [(tr("PC_Zeit"), fmt_wall(wall)), (tr("Zeit_s"), f"{t:.4f}"), (tr("CAN_ID"), f"{can_id:08X}"),
+                ("PGN", f"{pgn} – {pg.pgn_name(pgn, full) or tr('unbekannt')}"), ("Prio", prio), ("SA", sa), ("DA", da),
+                (tr("Daten_hex"), full.hex(" ").upper() + (f"  ({len(full)} Bytes)" if len(full) > 8 else ""))]
+        win = self.detail_win
+        if win is None or not win.winfo_exists():
+            win = self.detail_win = tk.Toplevel(self)
+            win.title(tr("Nachricht"))
+            win.geometry("620x520")
+            self._wd_note = ttk.Label(win, wraplength=590, foreground="#c62828")
+            self._wd_note.pack(fill="x", padx=6, pady=(6, 0))
+            self._wd_tree = ttk.Treeview(win, columns=("f", "v"), show="headings")
+            self._wd_tree.heading("f", text=tr("Feld"))
+            self._wd_tree.heading("v", text=tr("Wert"))
+            self._wd_tree.column("f", width=220, anchor="w")
+            self._wd_tree.column("v", width=360, anchor="w")
+            self._wd_tree.pack(fill="both", expand=True, padx=6, pady=6)
+            self._enable_copy(self._wd_tree)
+        self._wd_note.config(text=note)
+        tree = self._wd_tree
+        tree.delete(*tree.get_children())
+        for row in head:
+            tree.insert("", "end", values=row)
+        for row in rows:
+            tree.insert("", "end", values=row)
+        win.lift()
 
     def show_detail(self):
         """Alle dekodierten Felder des gewählten PGN im unteren Bereich."""
