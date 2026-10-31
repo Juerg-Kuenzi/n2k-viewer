@@ -312,5 +312,6 @@
   "Keine gültigen Zeilen in der Datei.": "No valid rows in the file.",
   "Log wird geladen … {p:.0f} %": "Loading log … {p:.0f} %",
   "Log geladen: {name} – {f} Frames, {e} aufgezeichnete Fehler": "Log loaded: {name} – {f} frames, {e} recorded errors",
-  "{n} Zeilen konnten nicht gelesen werden.": "{n} rows could not be read."
+  "{n} Zeilen konnten nicht gelesen werden.": "{n} rows could not be read.",
+  "Zeitstempel innerhalb eines Datenblocks schätzen (gleichmässig verteilt)": "Estimate timestamps within a data block (evenly distributed)"
 }
