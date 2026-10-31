@@ -51,6 +51,13 @@ register(65350, "Meine Firma: Sensorwerte", manufacturer=999, fields=[
 Der Hersteller-Header (Bit 0–15) wird automatisch dekodiert, Nutzdaten beginnen bei Bit 16.
 Wiederholte Gruppen: `Repeat`; Sonderfälle: `@decoder`. Details im Kopf von `n2k_pgns.py`.
 
+## Einstellungen
+
+Der Button **„Einstellungen…“** öffnet den Konfigurationsdialog: Sprache, CAN-Controller-Abfrage (ein/aus, Intervall),
+„Bei Fehler stoppen“ (Auslöser, Nachlauf, automatisch speichern, Log-Ordner) und Log-Puffergrösse. Port, Bitrate und
+Modus stehen oben in der Leiste. Alles wird in `n2k-viewer.json` gespeichert (`%APPDATA%` bzw. Home-Ordner) und kann
+dort auch von Hand bearbeitet werden.
+
 ## Fehleranzeige
 
 Unter der Werkzeugleiste zeigen farbige Zähler (grün = keine Fehler, gelb/orange = frühere Fehler, rot = Fehler in den
@@ -71,8 +78,9 @@ Grenzen:
   auf 0. Einzelne Fehler auf einem ausgelasteten Bus sind deshalb meist nicht sichtbar, nur anhaltende Probleme
   (z. B. Terminierung, falsche Bitrate, defekte Leitung). Die Viewer-seitigen Zähler sind für kurze Störungen aussagekräftiger.
 - Bus-Off lässt sich nicht erkennen (der Zähler ist 8 Bit breit). Das Protokoll der Statusabfrage ist nur teilweise
-  dokumentiert; meldet der Adapter nichts, steht „Adapter meldet keine Zähler“. Mit `"poll_status": false` in
-  `n2k-viewer.json` lässt sich die Abfrage abschalten (`"status_interval"` = Abstand in Sekunden, Standard 0.25).
+  dokumentiert; meldet der Adapter nichts, steht „Adapter meldet keine Zähler“. Die Abfrage ist
+  **standardmässig aus**, weil sie beim Seeed-Adapter Frames verlieren lassen kann (in Messungen traten damit
+  Fast-Packet-Lücken und Synchronisationsverluste auf, ohne sie nicht). Einschalten unter „Einstellungen…“.
 - In den ersten 2 s nach dem Verbinden werden angeschnittene Nachrichten nicht als Fehler gezählt.
 
 ### Fehler aufzeichnen und bei Fehler stoppen
