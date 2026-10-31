@@ -286,8 +286,11 @@ class App(tk.Tk):
         self.rate_n = 0
         self.hw = None                # CAN-Controller: {'rec','tec','max_rec','max_tec'} oder None
         self.hw_polls = 0
-        self.poll_status = bool(self.cfg.get("poll_status", True))
-        self.status_interval = float(self.cfg.get("status_interval", 0.25))
+        self.poll_status = bool(self.cfg.get("poll_status", False))     # Standard: aus (die Abfrage kann Frames verlieren lassen)
+        try:
+            self.status_interval = max(0.1, min(10.0, float(self.cfg.get("status_interval", 0.5))))
+        except (TypeError, ValueError):
+            self.status_interval = 0.5
         # Stopp bei Fehler
         self.stop_on_error = bool(self.cfg.get("stop_on_error", False))
         tc = self.cfg.get("trigger_cats")
@@ -389,6 +392,7 @@ class App(tk.Tk):
         self._tx(ttk.Button(top, command=self.clear), "Leeren").pack(side="left", padx=4)
         self._tx(ttk.Button(top, command=self.save_log), "Log speichern (CSV)").pack(side="left")
         self._tx(ttk.Button(top, command=self.reload_plugins), "Plugins neu laden").pack(side="left", padx=4)
+        self._tx(ttk.Button(top, command=self.open_settings), "Einstellungen…").pack(side="left")
         # Sprachauswahl (rechts) – Sprachen werden aus locales/*.json erkannt
         langs = i18n.languages()
         self.lang = ttk.Combobox(top, width=12, state="readonly", values=[n for _c, n in langs])
@@ -744,6 +748,118 @@ class App(tk.Tk):
                         post_s=self.post_s, autosave=self.autosave)
         save_config(self.cfg)
 
+    # ----- Einstellungen -----
+    def apply_settings(self, v):
+        """Übernimmt die Werte des Einstellungsdialogs (dict), gleicht die Leisten-Widgets ab und speichert."""
+        self.poll_status = bool(v["poll_status"])
+        self.status_interval = max(0.1, min(10.0, float(v["status_interval"])))
+        self.stop_on_error = bool(v["stop_on_error"])
+        self.trigger_cats = {k for k in v["trigger_cats"] if k in ERR_CATS}
+        self.post_s = max(0.0, min(60.0, float(v["post_s"])))
+        self.autosave = bool(v["autosave"])
+        if v["log_dir"]:
+            self.log_dir = v["log_dir"]
+        self.log_max = max(10000, int(v["log_max"]))
+        self.stop_var.set(self.stop_on_error)
+        for k, var in self.trig_vars.items():
+            var.set(k in self.trigger_cats)
+        self.post_var.set("{:g}".format(self.post_s))
+        self.auto_var.set(self.autosave)
+        self.cfg.update(poll_status=self.poll_status, status_interval=self.status_interval,
+                        stop_on_error=self.stop_on_error, trigger_cats=sorted(self.trigger_cats),
+                        post_s=self.post_s, autosave=self.autosave, log_dir=self.log_dir, log_max=self.log_max)
+        save_config(self.cfg)
+        self.update_errors()
+
+    def open_settings(self):
+        win = tk.Toplevel(self)
+        win.title(tr("Einstellungen"))
+        win.transient(self)
+        f = ttk.Frame(win, padding=10)
+        f.pack(fill="both", expand=True)
+        r = 0
+        ttk.Label(f, text=tr("Sprache:")).grid(row=r, column=0, sticky="w")
+        langs = i18n.languages()
+        lang = ttk.Combobox(f, width=14, state="readonly", values=[n for _c, n in langs])
+        lang.current([c for c, _n in langs].index(i18n.get_language()))
+        lang.grid(row=r, column=1, sticky="w", pady=2)
+        r += 1
+        poll = tk.BooleanVar(value=self.poll_status)
+        ttk.Checkbutton(f, text=tr("CAN-Controller-Zähler abfragen (Statusabfrage an den Adapter)"), variable=poll
+                        ).grid(row=r, column=0, columnspan=3, sticky="w", pady=(8, 0))
+        r += 1
+        ttk.Label(f, text=tr("Hinweis: Die Abfrage kann beim Seeed-Adapter dazu führen, dass Frames verloren gehen."),
+                  foreground="#666").grid(row=r, column=0, columnspan=3, sticky="w", padx=(22, 0))
+        r += 1
+        ttk.Label(f, text=tr("Abfrageintervall [s]:")).grid(row=r, column=0, sticky="w", padx=(22, 0))
+        interval = tk.StringVar(value="{:g}".format(self.status_interval))
+        ttk.Spinbox(f, from_=0.1, to=10, increment=0.1, width=6, textvariable=interval).grid(row=r, column=1, sticky="w")
+        r += 1
+        ttk.Separator(f).grid(row=r, column=0, columnspan=3, sticky="ew", pady=8)
+        r += 1
+        stop = tk.BooleanVar(value=self.stop_on_error)
+        ttk.Checkbutton(f, text=tr("Bei Fehler stoppen"), variable=stop).grid(row=r, column=0, columnspan=3, sticky="w")
+        r += 1
+        ttk.Label(f, text=tr("Auslöser")).grid(row=r, column=0, sticky="nw", padx=(22, 0))
+        tv = {}
+        tf = ttk.Frame(f)
+        tf.grid(row=r, column=1, columnspan=2, sticky="w")
+        for key, (label, _severe) in ERR_CATS.items():
+            tv[key] = tk.BooleanVar(value=key in self.trigger_cats)
+            ttk.Checkbutton(tf, text=tr(label), variable=tv[key]).pack(anchor="w")
+        r += 1
+        ttk.Label(f, text=tr("Nachlauf [s]:")).grid(row=r, column=0, sticky="w", padx=(22, 0))
+        post = tk.StringVar(value="{:g}".format(self.post_s))
+        ttk.Spinbox(f, from_=0, to=60, width=6, textvariable=post).grid(row=r, column=1, sticky="w")
+        r += 1
+        auto = tk.BooleanVar(value=self.autosave)
+        ttk.Checkbutton(f, text=tr("Log bei Stopp automatisch speichern"), variable=auto
+                        ).grid(row=r, column=0, columnspan=3, sticky="w", padx=(22, 0))
+        r += 1
+        ttk.Label(f, text=tr("Log-Ordner")).grid(row=r, column=0, sticky="w", padx=(22, 0))
+        ldir = tk.StringVar(value=self.log_dir)
+        ttk.Entry(f, width=40, textvariable=ldir).grid(row=r, column=1, sticky="we")
+
+        def browse():
+            d = filedialog.askdirectory(initialdir=ldir.get() if os.path.isdir(ldir.get()) else None,
+                                        title=tr("Log-Ordner"), parent=win)
+            if d:
+                ldir.set(d)
+        ttk.Button(f, text="…", width=3, command=browse).grid(row=r, column=2, sticky="w", padx=4)
+        r += 1
+        ttk.Separator(f).grid(row=r, column=0, columnspan=3, sticky="ew", pady=8)
+        r += 1
+        ttk.Label(f, text=tr("Log-Puffer [Frames]:")).grid(row=r, column=0, sticky="w")
+        lmax = tk.StringVar(value=str(self.log_max))
+        ttk.Spinbox(f, from_=10000, to=5000000, increment=10000, width=9, textvariable=lmax).grid(row=r, column=1, sticky="w")
+        r += 1
+
+        def num(var, default, lo, hi):
+            try:
+                return max(lo, min(hi, float(str(var.get()).replace(",", "."))))
+            except ValueError:
+                return default
+
+        def ok():
+            self.apply_settings(dict(
+                poll_status=poll.get(), status_interval=num(interval, self.status_interval, 0.1, 10),
+                stop_on_error=stop.get(), trigger_cats=[k for k, vv in tv.items() if vv.get()],
+                post_s=num(post, self.post_s, 0, 60), autosave=auto.get(), log_dir=ldir.get().strip(),
+                log_max=int(num(lmax, self.log_max, 10000, 5000000))))
+            codes = [c for c, _n in langs]
+            i = lang.current()
+            win.destroy()
+            if isinstance(i, int) and 0 <= i < len(codes) and codes[i] != i18n.get_language():
+                self.lang.current(i)
+                self.on_language()
+
+        bt = ttk.Frame(f)
+        bt.grid(row=r, column=0, columnspan=3, sticky="e", pady=(10, 0))
+        ttk.Button(bt, text=tr("OK"), command=ok).pack(side="left", padx=4)
+        ttk.Button(bt, text=tr("Abbrechen"), command=win.destroy).pack(side="left")
+        f.columnconfigure(1, weight=1)
+        win.grab_set()
+
     def choose_log_dir(self):
         d = filedialog.askdirectory(initialdir=self.log_dir if os.path.isdir(self.log_dir) else None, title=tr("Log-Ordner"))
         if d:
@@ -851,7 +967,9 @@ class App(tk.Tk):
         now = time.time()
         name = tr(ERR_CATS["can"][0])
         if self.hw is None:
-            if self.poll_status and self.hw_polls >= 8:
+            if not self.poll_status:
+                self._badge(self.badges["can"], name + ": " + tr("Abfrage aus (Einstellungen)"), "gray")
+            elif self.hw_polls >= 8:
                 self._badge(self.badges["can"], name + ": " + tr("Adapter meldet keine Zähler"), "gray")
             else:
                 self._badge(self.badges["can"], name + ": TEC – / REC –", "gray")
