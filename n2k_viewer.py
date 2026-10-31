@@ -26,7 +26,7 @@ from i18n import t as tr          # tr(): Text in die gewählte Sprache überset
 
 # Einstellungen (Sprache, Port, Bitrate, Modus): %APPDATA%\n2k-viewer.json bzw. ~/n2k-viewer.json
 # Version = Name des GitHub-Releases (Tag). Vor jedem neuen Release hier anpassen.
-VERSION = "V0.2"
+VERSION = "V1.0"
 
 CONFIG_FILE = os.path.join(os.environ.get("APPDATA") or os.path.expanduser("~"), "n2k-viewer.json")
 
