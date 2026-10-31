@@ -48,6 +48,30 @@ register(65350, "Meine Firma: Sensorwerte", manufacturer=999, fields=[
 Der Hersteller-Header (Bit 0–15) wird automatisch dekodiert, Nutzdaten beginnen bei Bit 16.
 Wiederholte Gruppen: `Repeat`; Sonderfälle: `@decoder`. Details im Kopf von `n2k_pgns.py`.
 
+## Fehleranzeige
+
+Unter der Werkzeugleiste zeigen farbige Zähler (grün = keine Fehler, gelb/orange = frühere Fehler, rot = Fehler in den
+letzten 10 s). Der Tab „Fehlerliste“ listet jedes Ereignis mit Zeit, Quelle, PGN und Details (höchstens 20 Einträge pro
+Sekunde, die Zähler bleiben exakt). „Fehler zurücksetzen“ setzt alles zurück; beim Verbinden wird automatisch zurückgesetzt.
+
+| Zähler | Quelle | Bedeutung |
+|---|---|---|
+| **CAN-Controller** | Adapter (Statusabfrage, 4×/s) | Empfangs- (REC) und Sendefehlerzähler (TEC) des CAN-Controllers, dazu Maximum seit dem Verbinden. Ab 96 orange, ab 128 rot (Error-Passive). |
+| **Fast-Packet** | Viewer | verlorener/vertauschter Folgeframe, falsche Sequenznummer, neue Nachricht vor Ende der alten, ungültige Länge. Eine gestörte Nachricht zählt nur einmal. |
+| **Serielle Daten** | Viewer | Synchronisationsverlust im Datenstrom des Adapters (Frame ohne Endbyte, verworfene Bytes). |
+| **Frame-Format** | Viewer | 11-Bit-Frames auf dem Bus (NMEA2000 verwendet nur 29-Bit) – oft falsche Bitrate oder falscher Bus. |
+| **ISO-NAK** | Bus | Geräte antworten auf eine Anfrage mit NAK / Zugriff verweigert / Adresse belegt (kann auch normal sein, z. B. nicht unterstütztes PGN – nur gelb). |
+
+Grenzen:
+
+- Die Controller-Zähler sind **Momentanwerte**, keine Summen: der Empfangszähler sinkt mit jedem fehlerfreien Frame wieder
+  auf 0. Einzelne Fehler auf einem ausgelasteten Bus sind deshalb meist nicht sichtbar, nur anhaltende Probleme
+  (z. B. Terminierung, falsche Bitrate, defekte Leitung). Die Viewer-seitigen Zähler sind für kurze Störungen aussagekräftiger.
+- Bus-Off lässt sich nicht erkennen (der Zähler ist 8 Bit breit). Das Protokoll der Statusabfrage ist nur teilweise
+  dokumentiert; meldet der Adapter nichts, steht „Adapter meldet keine Zähler“. Mit `"poll_status": false` in
+  `n2k-viewer.json` lässt sich die Abfrage abschalten (`"status_interval"` = Abstand in Sekunden, Standard 0.25).
+- In den ersten 2 s nach dem Verbinden werden angeschnittene Nachrichten nicht als Fehler gezählt.
+
 ## Sprachen / Languages
 
 Oberfläche **und** dekodierte Feldnamen/Werte gibt es auf Deutsch und Englisch. Die Sprache wählst du oben rechts
@@ -68,6 +92,8 @@ Plugins können eigene Texte mit `add_translations("en", {...})` übersetzen (Be
 - Die Bitlayouts der Standard-PGNs sind nach bestem Wissen umgesetzt, aber nicht gegen die offizielle
   Spezifikation geprüft. Bei Abweichungen bitte ein Issue mit einem Mitschnitt anlegen.
 - Der Seeed-Analyzer ist nicht galvanisch getrennt; Bus korrekt terminieren (CAN_H, CAN_L, GND).
+- „Nur Lauschen“ sendet den Moduscode 0x02 (Silent) laut Seeed-/Copperhill-Protokoll; die Waveshare-Dokumentation
+  nennt für Silent 0x01. Kommen im Lauschmodus keine Frames an, „Normal“ probieren (der Viewer sendet auch dort nichts).
 
 ## Lizenz
 

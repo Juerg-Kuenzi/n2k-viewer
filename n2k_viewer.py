@@ -65,27 +65,83 @@ def build_config(bitrate=250000, mode=2):
     return bytes(cmd)
 
 
+def build_status_request():
+    """Controller-Status abfragen (ID 0x04, 20 Byte). Die Antwort enthält Byte 3 = Empfangsfehlerzähler (REC)
+    und Byte 4 = Sendefehlerzähler (TEC) des CAN-Controllers."""
+    cmd = bytearray([0xAA, 0x55, 0x04]) + bytes(16)
+    cmd.append(sum(cmd[2:]) & 0xFF)
+    return bytes(cmd)
+
+
+STATUS_REQUEST = build_status_request()
+
+# Fehlerkategorien: Schlüssel -> (Anzeigename, schwerwiegend?). "schwerwiegend" färbt die Anzeige rot,
+# solange der letzte Fehler weniger als 10 s zurückliegt; sonst orange. Nicht schwerwiegende nur gelb.
+ERR_CATS = {
+    "can": ("CAN-Controller", True),
+    "fp": ("Fast-Packet", True),
+    "serial": ("Serielle Daten", True),
+    "fmt": ("Frame-Format", True),
+    "nak": ("ISO-NAK", False),
+}
+WARMUP_S = 2.0       # in den ersten Sekunden nach dem Verbinden sind angeschnittene Frames normal
+BADGE_COLORS = {     # Name -> (Hintergrund, Schrift)
+    "green": ("#2e7d32", "white"), "yellow": ("#f9a825", "black"), "orange": ("#ef6c00", "white"),
+    "red": ("#c62828", "white"), "gray": ("#9e9e9e", "white"),
+}
+FP_ERRORS = {
+    "orphan": "Folgeframe {fc} ohne Startframe",
+    "order": "Folgeframe {fc} statt {exp} (Frame verloren)",
+    "seq": "Sequenznummer {got} statt {exp} (Nachricht gestört)",
+    "restart": "Neue Nachricht begonnen, bevor die vorige vollständig war ({have} von {total} Bytes)",
+    "len": "Ungültige Länge {total} Bytes (max. 223)",
+}
+
+
 class FrameParser:
-    """Zerlegt den Bytestrom in CAN-Frames (variable Länge: AA <info> <id> <data> 55)."""
+    """Zerlegt den Bytestrom in CAN-Frames (variable Länge: AA <info> <id> <data> 55).
+
+    Erkennt außerdem 20-Byte-Steuerframes (AA 55 ...), z. B. die Antwort auf die Statusabfrage (ID 0x04).
+    Ereignisse sammelt er in ``events`` (Abholen mit take_events()):
+      ("status", rec, tec)          Fehlerzähler des CAN-Controllers
+      ("serial", frames_ohne_ende, verworfene_bytes)   Synchronisationsverlust im Bytestrom (je feed()-Aufruf höchstens einmal)
+    """
 
     def __init__(self):
         self.buf = bytearray()
+        self.events = []
+
+    def take_events(self):
+        ev, self.events = self.events, []
+        return ev
 
     def feed(self, data):
         self.buf += data
         frames = []
         b = self.buf
+        junk = 0          # verworfene Bytes
+        bad_end = 0       # Frames ohne Endbyte 0x55
         while True:
             i = b.find(0xAA)
             if i < 0:
+                junk += len(b)
                 b.clear()
                 break
             if i > 0:
+                junk += i
                 del b[:i]
             if len(b) < 2:
                 break
             info = b[1]
+            if info == 0x55:                      # 20-Byte-Steuerframe (kein CAN-Datenframe: dort sind Bit 7/6 gesetzt)
+                if len(b) < 20:
+                    break
+                if b[2] == 0x04:
+                    self.events.append(("status", b[3], b[4]))
+                del b[:20]
+                continue
             if (info & 0xC0) != 0xC0:
+                junk += 1
                 del b[0]
                 continue
             ext = bool(info & 0x20)
@@ -96,12 +152,15 @@ class FrameParser:
             if len(b) < total:
                 break
             if b[total - 1] != 0x55:
+                bad_end += 1
                 del b[0]
                 continue
             can_id = int.from_bytes(b[2:2 + idlen], "little")
             payload = bytes(b[2 + idlen:2 + idlen + dlc])
             del b[:total]
             frames.append((can_id, ext, rtr, payload))
+        if junk or bad_end:
+            self.events.append(("serial", bad_end, junk))
         return frames
 
 
@@ -124,8 +183,22 @@ def split_id(can_id):
 
 
 class FastPacket:
+    """Setzt Fast-Packet-Nachrichten zusammen und meldet Fehler (Abholen mit take_errors()).
+    Eine gestörte Nachricht wird nur einmal gemeldet, nicht einmal pro Folgeframe."""
+
     def __init__(self):
         self.state = {}
+        self.dead = {}        # (sa, pgn) -> Sequenznummer einer bereits gemeldeten, gestörten Nachricht
+        self.errors = []      # (Code, Info-Dict) – Codes siehe FP_ERRORS
+
+    def take_errors(self):
+        err, self.errors = self.errors, []
+        return err
+
+    def _fail(self, key, seq, code, **info):
+        self.state.pop(key, None)
+        self.dead[key] = seq
+        self.errors.append((code, info))
 
     def feed(self, sa, pgn, d):
         """Gibt komplette Daten zurück oder None."""
@@ -133,19 +206,34 @@ class FastPacket:
             return None
         key = (sa, pgn)
         fc = d[0] & 0x1F
+        seq = d[0] >> 5
         if fc == 0:
             if len(d) < 2:
                 return None
+            self.dead.pop(key, None)
+            old = self.state.pop(key, None)
+            if old:
+                self.errors.append(("restart", {"have": len(old["data"]), "total": old["total"]}))
             total = d[1]
+            if total > 223:
+                self._fail(key, seq, "len", total=total)
+                return None
             data = bytearray(d[2:8])
             if len(data) >= total:
-                self.state.pop(key, None)
                 return bytes(data[:total])
-            self.state[key] = {"seq": d[0] >> 5, "total": total, "data": data, "next": 1}
+            self.state[key] = {"seq": seq, "total": total, "data": data, "next": 1}
             return None
         st = self.state.get(key)
-        if not st or st["seq"] != (d[0] >> 5) or st["next"] != fc:
-            self.state.pop(key, None)
+        if not st:
+            if self.dead.get(key) != seq:         # Rest einer schon gemeldeten Nachricht: still verwerfen
+                self.errors.append(("orphan", {"fc": fc}))
+                self.dead[key] = seq
+            return None
+        if st["seq"] != seq:
+            self._fail(key, st["seq"], "seq", got=seq, exp=st["seq"])
+            return None
+        if st["next"] != fc:
+            self._fail(key, st["seq"], "order", fc=fc, exp=st["next"])
             return None
         st["data"] += d[1:8]
         st["next"] += 1
@@ -160,6 +248,7 @@ class FastPacket:
 # --------------------------------------------------------------------------
 class App(tk.Tk):
     TRACE_MAX = 3000
+    ERR_MAX = 1000
 
     def __init__(self):
         super().__init__()
@@ -184,6 +273,15 @@ class App(tk.Tk):
         self.t0 = time.time()
         self.sel_key = None
         self.iid_key = {}             # Treeview-iid -> (sa, pgn)
+        self.err = {k: 0 for k in ERR_CATS}   # Fehlerzähler je Kategorie
+        self.err_last = {}            # Kategorie -> time.time() des letzten Fehlers
+        self.err_dirty = False
+        self.rate_t = 0.0             # Begrenzung der Fehlerliste (höchstens 20 Einträge/s, Zähler bleiben exakt)
+        self.rate_n = 0
+        self.hw = None                # CAN-Controller: {'rec','tec','max_rec','max_tec'} oder None
+        self.hw_polls = 0
+        self.poll_status = bool(self.cfg.get("poll_status", True))
+        self.status_interval = float(self.cfg.get("status_interval", 0.25))
         self.plugin_res = pg.load_plugins()
         self._build()
         self.refresh_ports()
@@ -224,6 +322,7 @@ class App(tk.Tk):
             r["dirty"] = True
         self.show_detail()
         self.update_status()
+        self.update_errors()
 
     def on_language(self, _event=None):
         codes = [c for c, _n in i18n.languages()]
@@ -270,6 +369,16 @@ class App(tk.Tk):
         self.lang.bind("<<ComboboxSelected>>", self.on_language)
         self.lang.pack(side="right")
         self._tx(ttk.Label(top), "Sprache:").pack(side="right", padx=4)
+
+        bar = ttk.Frame(self, padding=(6, 0, 6, 4))
+        bar.pack(fill="x")
+        self._tx(ttk.Label(bar), "Fehlerzähler:").pack(side="left")
+        self.badges = {}
+        for key in ERR_CATS:
+            lab = tk.Label(bar, padx=8, pady=2, bd=1, relief="solid")
+            lab.pack(side="left", padx=(6, 0))
+            self.badges[key] = lab
+        self._tx(ttk.Button(bar, command=self.reset_errors), "Fehler zurücksetzen").pack(side="right")
 
         nb = ttk.Notebook(self)
         nb.pack(fill="both", expand=True, padx=6, pady=4)
@@ -324,9 +433,26 @@ class App(tk.Tk):
         self.tr.pack(side="left", fill="both", expand=True)
         sb2.pack(side="right", fill="y")
 
+        # Fehlerliste
+        f3 = ttk.Frame(nb)
+        nb.add(f3, text=tr("Fehlerliste"))
+        self.err_tab = (nb, f3)
+        cols3 = ("t", "cat", "sa", "pgn", "msg")
+        self.errtv = ttk.Treeview(f3, columns=cols3, show="headings")
+        for c, title, w in (("t", "Zeit [s]", 80), ("cat", "Kategorie", 130), ("sa", "SA", 45), ("pgn", "PGN", 70),
+                            ("msg", "Details", 700)):
+            self._hd(self.errtv, c, title)
+            self.errtv.column(c, width=w, anchor="w")
+        self.errtv.tag_configure("severe", foreground="#c62828")
+        sb4 = ttk.Scrollbar(f3, orient="vertical", command=self.errtv.yview)
+        self.errtv.configure(yscrollcommand=sb4.set)
+        self.errtv.pack(side="left", fill="both", expand=True)
+        sb4.pack(side="right", fill="y")
+
         self.status = ttk.Label(self, relief="sunken", anchor="w")
         self.status.pack(fill="x", side="bottom")
         self.update_status()
+        self.update_errors()
 
     # ----- Verbindung -----
     def refresh_ports(self):
@@ -359,6 +485,10 @@ class App(tk.Tk):
             self.ser = None
             return
         self.parser = FrameParser()
+        self.fp = FastPacket()
+        self.hw = None
+        self.hw_polls = 0
+        self.reset_errors()
         self.running = True
         self.t0 = time.time()
         self.thread = threading.Thread(target=self.reader, daemon=True)
@@ -380,7 +510,17 @@ class App(tk.Tk):
         self.btn_conn.config(text=tr("Verbinden"))
 
     def reader(self):
+        last_req = 0.0
         while self.running:
+            now = time.time()
+            if self.poll_status and now - last_req >= self.status_interval:
+                last_req = now
+                try:
+                    self.ser.write(STATUS_REQUEST)     # Befehl an den Adapter, nichts davon geht auf den CAN-Bus
+                    self.hw_polls += 1
+                except Exception as e:
+                    self.q.put(("error", str(e)))
+                    break
             try:
                 data = self.ser.read(4096)
             except Exception as e:
@@ -390,6 +530,11 @@ class App(tk.Tk):
                 t = time.time() - self.t0
                 for f in self.parser.feed(data):
                     self.q.put(("frame", t, f))
+                for ev in self.parser.take_events():
+                    if ev[0] == "status":
+                        self.q.put(("hw", t, ev[1], ev[2]))
+                    elif ev[0] == "serial":
+                        self.q.put(("serial", t, ev[1], ev[2]))
         self.running = False
 
     # ----- Verarbeitung -----
@@ -411,6 +556,7 @@ class App(tk.Tk):
     def handle_frame(self, t, frame):
         can_id, ext, rtr, d = frame
         if not ext:
+            self.add_error(t, "fmt", tr("Standard-Frame (11 Bit) ID 0x{id:03X} – kein NMEA2000").format(id=can_id))
             return
         prio, pgn, sa, da = split_id(can_id)
         self.total += 1
@@ -423,10 +569,18 @@ class App(tk.Tk):
         # Daten der Anwendungsebene
         if pg.is_fast_packet(pgn):
             full = self.fp.feed(sa, pgn, d)
+            for code, info in self.fp.take_errors():
+                if code == "orphan" and t < WARMUP_S:      # beim Verbinden mitten in einer Nachricht ist das normal
+                    continue
+                self.add_error(t, "fp", tr(FP_ERRORS[code]).format(**info), sa, pgn)
             if full is None:
                 return
         else:
             full = d
+        if pgn == 59392 and len(full) >= 8 and full[0] in (1, 2, 3):      # ISO Acknowledgement: NAK / verweigert / belegt
+            what = {1: "NAK", 2: "Zugriff verweigert", 3: "Adresse belegt"}[full[0]]
+            self.add_error(t, "nak", tr("{what} für PGN {pgn} (Antwort an Adresse {da})").format(
+                what=tr(what), pgn=int.from_bytes(full[5:8], "little"), da=da), sa, pgn)
         r = self.pgn_rows.get((sa, pgn))
         if r is None:
             iid = self.tv.insert("", "end", values=(sa, pgn, name, 0, "", "", ""))
@@ -449,6 +603,13 @@ class App(tk.Tk):
                 n += 1
                 if item[0] == "frame":
                     self.handle_frame(item[1], item[2])
+                elif item[0] == "hw":
+                    self.on_hw_status(item[1], item[2], item[3])
+                elif item[0] == "serial":
+                    if item[1] >= WARMUP_S:                     # angeschnittene Bytes direkt nach dem Verbinden ignorieren
+                        self.add_error(item[1], "serial", tr(
+                            "{bad} Frame(s) ohne Endbyte, {junk} Byte(s) verworfen (Synchronisation verloren)").format(
+                            bad=item[2], junk=item[3]))
                 elif item[0] == "error":
                     messagebox.showerror(tr("Serieller Fehler"), item[1])
                     self.disconnect()
@@ -471,13 +632,94 @@ class App(tk.Tk):
                 self.tr.delete(*ch[:len(ch) - self.TRACE_MAX])
             if ch:
                 self.tr.see(self.tr.get_children()[-1])
+        if self.err_dirty:
+            self.err_dirty = False
+            self.update_errors()
         now = time.time()
         if now - self.last_tick >= 1.0:
             fps = (self.total - self.last_total) / (now - self.last_tick)
             self.last_total, self.last_tick = self.total, now
             self.fps = fps
             self.update_status()
+            self.update_errors()      # Farbe wechselt nach 10 s von rot auf orange
         self.after(100, self.tick)
+
+    # ----- Fehleranzeige -----
+    def add_error(self, t, cat, text, sa=None, pgn=None):
+        """Fehler zählen und (begrenzt) in die Fehlerliste eintragen."""
+        self.err[cat] += 1
+        now = time.time()
+        self.err_last[cat] = now
+        if now - self.rate_t >= 1.0:
+            self.rate_t, self.rate_n = now, 0
+        self.rate_n += 1
+        if self.rate_n <= 20:
+            self.errtv.insert("", "end", values=(f"{t:.3f}", tr(ERR_CATS[cat][0]), "" if sa is None else sa,
+                                                 "" if pgn is None else pgn, text),
+                              tags=("severe" if ERR_CATS[cat][1] else "info",))
+            ch = self.errtv.get_children()
+            if len(ch) > self.ERR_MAX:
+                self.errtv.delete(*ch[:len(ch) - self.ERR_MAX])
+            self.errtv.see(ch[-1])
+        self.err_dirty = True
+
+    def on_hw_status(self, t, rec, tec):
+        """Fehlerzähler des CAN-Controllers (Antwort des Adapters auf die Statusabfrage)."""
+        prev = self.hw
+        self.hw = {"rec": rec, "tec": tec,
+                   "max_rec": max(rec, prev["max_rec"] if prev else 0), "max_tec": max(tec, prev["max_tec"] if prev else 0)}
+        if prev is None:
+            if rec or tec:
+                self.add_error(t, "can", tr("Zählerstand bei erster Abfrage: TEC {tec} / REC {rec}").format(tec=tec, rec=rec))
+        else:
+            if rec > prev["rec"]:
+                self.add_error(t, "can", tr("Empfangsfehlerzähler (REC) gestiegen: {a} → {b}").format(a=prev["rec"], b=rec))
+            if tec > prev["tec"]:
+                self.add_error(t, "can", tr("Sendefehlerzähler (TEC) gestiegen: {a} → {b}").format(a=prev["tec"], b=tec))
+        self.err_dirty = True
+
+    def reset_errors(self):
+        for k in self.err:
+            self.err[k] = 0
+        self.err_last.clear()
+        self.errtv.delete(*self.errtv.get_children())
+        if self.hw:
+            self.hw["max_rec"], self.hw["max_tec"] = self.hw["rec"], self.hw["tec"]
+        self.update_errors()
+
+    @staticmethod
+    def _badge(label, text, color):
+        bg, fg = BADGE_COLORS[color]
+        label.config(text=text, bg=bg, fg=fg)
+
+    def update_errors(self):
+        now = time.time()
+        name = tr(ERR_CATS["can"][0])
+        if self.hw is None:
+            if self.poll_status and self.hw_polls >= 8:
+                self._badge(self.badges["can"], name + ": " + tr("Adapter meldet keine Zähler"), "gray")
+            else:
+                self._badge(self.badges["can"], name + ": TEC – / REC –", "gray")
+        else:
+            h = self.hw
+            level = max(h["rec"], h["tec"])          # CAN: >=96 Warnung, >=128 Error-Passive
+            color = "green" if level == 0 else "yellow" if level < 96 else "orange" if level < 128 else "red"
+            self._badge(self.badges["can"], name + ": " + tr("TEC {tec} / REC {rec}  (Max {mt} / {mr})").format(
+                tec=h["tec"], rec=h["rec"], mt=h["max_tec"], mr=h["max_rec"]), color)
+        for key, (label, severe) in ERR_CATS.items():
+            if key == "can":
+                continue
+            n = self.err[key]
+            if n == 0:
+                color = "green"
+            elif not severe:
+                color = "yellow"
+            else:
+                color = "red" if now - self.err_last.get(key, 0) < 10 else "orange"
+            self._badge(self.badges[key], "{}: {}".format(tr(label), n), color)
+        total = sum(self.err.values())
+        nb, frame = self.err_tab
+        nb.tab(frame, text=tr("Fehlerliste") + (" ({})".format(total) if total else ""))
 
     def on_select(self, _event=None):
         sel = self.tv.selection()
