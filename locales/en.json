@@ -305,5 +305,12 @@
   "Abfrageintervall [s]:": "Polling interval [s]:",
   "Log-Puffer [Frames]:": "Log buffer [frames]:",
   "OK": "OK",
-  "Abbrechen": "Cancel"
+  "Abbrechen": "Cancel",
+  "PC_Zeit": "PC_time",
+  "Log laden…": "Load log…",
+  "Die laufende Aufzeichnung wird beendet. Fortfahren?": "The running recording will be stopped. Continue?",
+  "Keine gültigen Zeilen in der Datei.": "No valid rows in the file.",
+  "Log wird geladen … {p:.0f} %": "Loading log … {p:.0f} %",
+  "Log geladen: {name} – {f} Frames, {e} aufgezeichnete Fehler": "Log loaded: {name} – {f} frames, {e} recorded errors",
+  "{n} Zeilen konnten nicht gelesen werden.": "{n} rows could not be read."
 }

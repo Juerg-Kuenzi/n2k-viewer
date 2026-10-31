@@ -18,10 +18,19 @@ COM-Port wählen, Bitrate 250 kbit/s (NMEA2000-Standard), Modus „Nur Lauschen�
   Zeile anklicken → unten alle Felder einzeln, live aktualisiert.
 - **Trace:** alle Frames mit Zeitstempel, CAN-ID, Priorität, PGN, SA, DA.
 - **Fast-Packet** wird zusammengesetzt (z. B. 129029, 126996).
-- **Log-Export** als CSV (Spalten `Zeit_s;CAN_ID;Prio;PGN;SA;DA;Name;Daten_hex;Fehler`). Fehler stehen als eigene Zeilen
+- **Log-Export** als CSV (Spalten `PC_Zeit;Zeit_s;CAN_ID;Prio;PGN;SA;DA;Name;Daten_hex;Fehler`). `PC_Zeit` ist die
+  Uhrzeit des PC (lokal, Mikrosekunden), `Zeit_s` die Zeit seit dem Verbinden. Der Adapter liefert selbst keine
+  Zeitstempel: beide Zeiten stammen vom PC und entsprechen dem Moment, in dem der Datenblock aus dem USB-Treiber
+  gelesen wurde. Frames desselben Blocks (oft 200–300 Stück) haben deshalb denselben Zeitstempel. Fehler stehen als eigene Zeilen
   an der Stelle im Log, an der sie auftraten (Spalte `Fehler` = „Kategorie: Text“).
 - **Kopieren:** in allen Tabellen Zeilen markieren, `Strg+C` (mit Kopfzeile, tabulatorgetrennt, direkt in Excel einfügbar),
   `Strg+A` = alles, Rechtsklick → „Kopieren“ / „Alles kopieren“.
+
+- **Log laden…** liest ein gespeichertes Log (auch ältere ohne `PC_Zeit`, in jeder Sprache) und zeigt es wie eine
+  Live-Aufzeichnung: PGN-Übersicht (letzter Stand), Trace und Fehlerliste. Fast-Packet- und NAK-Fehler werden dabei aus
+  den Frames neu berechnet, serielle/CAN/Format-Fehler und die Auslösezeile stammen aus dem Log. Doppelklick auf einen
+  Fehler springt im Trace zur betreffenden Zeile. Bei mehr als 100000 Frames zeigt der Trace ein Fenster um den ersten
+  Fehler. „Verbinden“ verwirft das geladene Log.
 
 ## Dateien
 
