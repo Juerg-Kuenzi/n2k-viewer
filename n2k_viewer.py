@@ -117,13 +117,20 @@ class FrameParser:
     def __init__(self):
         self.buf = bytearray()
         self.events = []
+        self.pos = 0              # Anzahl bisher aus dem Puffer entfernter Bytes (absolute Position im Bytestrom)
+        self.last_ends = []       # Endposition jedes von feed() gelieferten Frames (absolut)
+        self.last_start = 0       # absolute Position des ersten neuen Bytes von feed()
+        self.last_end = 0         # ... und hinter dem letzten
 
     def take_events(self):
         ev, self.events = self.events, []
         return ev
 
     def feed(self, data):
+        self.last_start = self.pos + len(self.buf)
         self.buf += data
+        self.last_end = self.pos + len(self.buf)
+        self.last_ends = []
         frames = []
         b = self.buf
         junk = 0          # verworfene Bytes
@@ -132,10 +139,12 @@ class FrameParser:
             i = b.find(0xAA)
             if i < 0:
                 junk += len(b)
+                self.pos += len(b)
                 b.clear()
                 break
             if i > 0:
                 junk += i
+                self.pos += i
                 del b[:i]
             if len(b) < 2:
                 break
@@ -145,10 +154,12 @@ class FrameParser:
                     break
                 if b[2] == 0x04:
                     self.events.append(("status", b[3], b[4]))
+                self.pos += 20
                 del b[:20]
                 continue
             if (info & 0xC0) != 0xC0:
                 junk += 1
+                self.pos += 1
                 del b[0]
                 continue
             ext = bool(info & 0x20)
@@ -160,11 +171,14 @@ class FrameParser:
                 break
             if b[total - 1] != 0x55:
                 bad_end += 1
+                self.pos += 1
                 del b[0]
                 continue
             can_id = int.from_bytes(b[2:2 + idlen], "little")
             payload = bytes(b[2 + idlen:2 + idlen + dlc])
             del b[:total]
+            self.pos += total
+            self.last_ends.append(self.pos)
             frames.append((can_id, ext, rtr, payload))
         if junk or bad_end:
             self.events.append(("serial", bad_end, junk))
@@ -350,6 +364,7 @@ class App(tk.Tk):
         self.rate_n = 0
         self.hw = None                # CAN-Controller: {'rec','tec','max_rec','max_tec'} oder None
         self.hw_polls = 0
+        self.interp_time = bool(self.cfg.get("interp_time", True))    # Zeit innerhalb eines Datenblocks schätzen
         self.poll_status = bool(self.cfg.get("poll_status", False))     # Standard: aus (die Abfrage kann Frames verlieren lassen)
         try:
             self.status_interval = max(0.1, min(10.0, float(self.cfg.get("status_interval", 0.5))))
@@ -641,6 +656,7 @@ class App(tk.Tk):
 
     def reader(self):
         last_req = 0.0
+        last_t = time.perf_counter() - self.t0p
         while self.running:
             now = time.time()
             if self.poll_status and now - last_req >= self.status_interval:
@@ -658,8 +674,14 @@ class App(tk.Tk):
                 break
             if data:
                 t = time.perf_counter() - self.t0p
-                for f in self.parser.feed(data):
-                    self.q.put(("frame", t, f))
+                frames = self.parser.feed(data)
+                span = min(t - last_t, 1.0) if self.interp_time else 0.0     # Daten kamen irgendwann seit dem letzten Block an
+                p = self.parser
+                width = max(1, p.last_end - p.last_start)
+                for f, e in zip(frames, p.last_ends):
+                    frac = min(1.0, max(0.0, (e - p.last_start) / width))
+                    self.q.put(("frame", t - span * (1.0 - frac), f))
+                last_t = t
                 for ev in self.parser.take_events():
                     if ev[0] == "status":
                         self.q.put(("hw", t, ev[1], ev[2]))
@@ -837,6 +859,7 @@ class App(tk.Tk):
     def apply_settings(self, v):
         """Übernimmt die Werte des Einstellungsdialogs (dict), gleicht die Leisten-Widgets ab und speichert."""
         self.poll_status = bool(v["poll_status"])
+        self.interp_time = bool(v.get("interp_time", self.interp_time))
         self.status_interval = max(0.1, min(10.0, float(v["status_interval"])))
         self.stop_on_error = bool(v["stop_on_error"])
         self.trigger_cats = {k for k in v["trigger_cats"] if k in ERR_CATS}
@@ -850,7 +873,7 @@ class App(tk.Tk):
             var.set(k in self.trigger_cats)
         self.post_var.set("{:g}".format(self.post_s))
         self.auto_var.set(self.autosave)
-        self.cfg.update(poll_status=self.poll_status, status_interval=self.status_interval,
+        self.cfg.update(interp_time=self.interp_time, poll_status=self.poll_status, status_interval=self.status_interval,
                         stop_on_error=self.stop_on_error, trigger_cats=sorted(self.trigger_cats),
                         post_s=self.post_s, autosave=self.autosave, log_dir=self.log_dir, log_max=self.log_max)
         save_config(self.cfg)
@@ -868,6 +891,10 @@ class App(tk.Tk):
         lang = ttk.Combobox(f, width=14, state="readonly", values=[n for _c, n in langs])
         lang.current([c for c, _n in langs].index(i18n.get_language()))
         lang.grid(row=r, column=1, sticky="w", pady=2)
+        r += 1
+        interp = tk.BooleanVar(value=self.interp_time)
+        ttk.Checkbutton(f, text=tr("Zeitstempel innerhalb eines Datenblocks schätzen (gleichmässig verteilt)"), variable=interp
+                        ).grid(row=r, column=0, columnspan=3, sticky="w", pady=(8, 0))
         r += 1
         poll = tk.BooleanVar(value=self.poll_status)
         ttk.Checkbutton(f, text=tr("CAN-Controller-Zähler abfragen (Statusabfrage an den Adapter)"), variable=poll
@@ -927,7 +954,7 @@ class App(tk.Tk):
 
         def ok():
             self.apply_settings(dict(
-                poll_status=poll.get(), status_interval=num(interval, self.status_interval, 0.1, 10),
+                interp_time=interp.get(), poll_status=poll.get(), status_interval=num(interval, self.status_interval, 0.1, 10),
                 stop_on_error=stop.get(), trigger_cats=[k for k, vv in tv.items() if vv.get()],
                 post_s=num(post, self.post_s, 0, 60), autosave=auto.get(), log_dir=ldir.get().strip(),
                 log_max=int(num(lmax, self.log_max, 10000, 5000000))))
