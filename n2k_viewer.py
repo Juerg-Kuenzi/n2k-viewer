@@ -84,6 +84,8 @@ ERR_CATS = {
     "fmt": ("Frame-Format", True),
     "nak": ("ISO-NAK", False),
 }
+CAT_LABELS = {k: v[0] for k, v in ERR_CATS.items()}
+CAT_LABELS["trigger"] = "Auslöser"          # Markierung im Log: hier wurde die Aufzeichnung gestoppt
 WARMUP_S = 2.0       # in den ersten Sekunden nach dem Verbinden sind angeschnittene Frames normal
 BADGE_COLORS = {     # Name -> (Hintergrund, Schrift)
     "green": ("#2e7d32", "white"), "yellow": ("#f9a825", "black"), "orange": ("#ef6c00", "white"),
@@ -184,7 +186,9 @@ def split_id(can_id):
 
 class FastPacket:
     """Setzt Fast-Packet-Nachrichten zusammen und meldet Fehler (Abholen mit take_errors()).
-    Eine gestörte Nachricht wird nur einmal gemeldet, nicht einmal pro Folgeframe."""
+    Eine gestörte Nachricht wird nur einmal gemeldet, nicht einmal pro Folgeframe.
+    Zusammengesetzt wird getrennt je (Absender, Ziel, PGN): bei adressierten PGNs (z. B. 126720, 126208) steht die
+    Zieladresse in der CAN-ID, und ein Gerät kann gleichzeitig an mehrere Ziele senden."""
 
     def __init__(self):
         self.state = {}
@@ -200,11 +204,11 @@ class FastPacket:
         self.dead[key] = seq
         self.errors.append((code, info))
 
-    def feed(self, sa, pgn, d):
+    def feed(self, sa, pgn, d, da=255):
         """Gibt komplette Daten zurück oder None."""
         if not d:
             return None
-        key = (sa, pgn)
+        key = (sa, da, pgn)
         fc = d[0] & 0x1F
         seq = d[0] >> 5
         if fc == 0:
@@ -282,6 +286,23 @@ class App(tk.Tk):
         self.hw_polls = 0
         self.poll_status = bool(self.cfg.get("poll_status", True))
         self.status_interval = float(self.cfg.get("status_interval", 0.25))
+        # Stopp bei Fehler
+        self.stop_on_error = bool(self.cfg.get("stop_on_error", False))
+        tc = self.cfg.get("trigger_cats")
+        self.trigger_cats = {k for k in tc if k in ERR_CATS} if isinstance(tc, list) else {"can", "fp", "serial", "fmt"}
+        try:
+            self.post_s = max(0.0, min(60.0, float(self.cfg.get("post_s", 2.0))))
+        except (TypeError, ValueError):
+            self.post_s = 2.0
+        self.autosave = bool(self.cfg.get("autosave", True))
+        self.log_dir = self.cfg.get("log_dir") or os.path.join(os.path.dirname(CONFIG_FILE), "n2k-viewer-logs")
+        try:
+            self.log_max = max(10000, int(self.cfg.get("log_max", 500000)))     # Ringpuffer: ältere Einträge fallen weg
+        except (TypeError, ValueError):
+            self.log_max = 500000
+        self.stop_at = None           # time.time() des geplanten Stopps (nach dem Nachlauf)
+        self.stop_info = None
+        self.stop_msg = ""
         self.plugin_res = pg.load_plugins()
         self._build()
         self.refresh_ports()
@@ -321,6 +342,7 @@ class App(tk.Tk):
         for r in self.pgn_rows.values():
             r["dirty"] = True
         self.show_detail()
+        self._build_trigger_menu()
         self.update_status()
         self.update_errors()
 
@@ -335,9 +357,12 @@ class App(tk.Tk):
 
     def update_status(self):
         state = tr("verbunden") if self.running else tr("nicht verbunden")
-        self.status.config(text=tr("{state} | Frames: {n} | {fps:.0f} Frames/s | PGN/SA-Kombinationen: {k} | Plugins: {p}").format(
+        text = tr("{state} | Frames: {n} | {fps:.0f} Frames/s | PGN/SA-Kombinationen: {k} | Plugins: {p}").format(
             state=state, n=self.total, fps=self.fps, k=len(self.pgn_rows),
-            p=sum(1 for _f, e in self.plugin_res if not e)))
+            p=sum(1 for _f, e in self.plugin_res if not e))
+        if self.stop_msg:
+            text += " | " + self.stop_msg
+        self.status.config(text=text)
 
     def _build(self):
         top = ttk.Frame(self, padding=6)
@@ -379,6 +404,26 @@ class App(tk.Tk):
             lab.pack(side="left", padx=(6, 0))
             self.badges[key] = lab
         self._tx(ttk.Button(bar, command=self.reset_errors), "Fehler zurücksetzen").pack(side="right")
+        self._tx(ttk.Button(bar, command=self.save_errors), "Fehler speichern (CSV)").pack(side="right", padx=6)
+
+        tb = ttk.Frame(self, padding=(6, 0, 6, 4))
+        tb.pack(fill="x")
+        self.stop_var = tk.BooleanVar(value=self.stop_on_error)
+        self._tx(ttk.Checkbutton(tb, variable=self.stop_var, command=self.on_trigger_change), "Bei Fehler stoppen").pack(side="left")
+        self.trig_btn = ttk.Menubutton(tb)
+        self.trig_btn.pack(side="left", padx=6)
+        self.trig_vars = {k: tk.BooleanVar(value=(k in self.trigger_cats)) for k in ERR_CATS}
+        self._build_trigger_menu()
+        self._tx(ttk.Label(tb), "Nachlauf [s]:").pack(side="left", padx=(8, 0))
+        self.post_var = tk.StringVar(value="{:g}".format(self.post_s))
+        spin = ttk.Spinbox(tb, from_=0, to=60, width=5, textvariable=self.post_var, command=self.on_trigger_change)
+        spin.pack(side="left", padx=4)
+        spin.bind("<FocusOut>", lambda _e: self.on_trigger_change())
+        spin.bind("<Return>", lambda _e: self.on_trigger_change())
+        self.auto_var = tk.BooleanVar(value=self.autosave)
+        self._tx(ttk.Checkbutton(tb, variable=self.auto_var, command=self.on_trigger_change),
+                 "Log bei Stopp automatisch speichern").pack(side="left", padx=8)
+        self._tx(ttk.Button(tb, command=self.choose_log_dir), "Log-Ordner…").pack(side="left")
 
         nb = ttk.Notebook(self)
         nb.pack(fill="both", expand=True, padx=6, pady=4)
@@ -408,7 +453,7 @@ class App(tk.Tk):
         self.detail_title.pack(fill="x", padx=2)
         dwrap = ttk.Frame(lower)
         dwrap.pack(fill="both", expand=True)
-        self.detail = ttk.Treeview(dwrap, columns=("f", "v"), show="headings", selectmode="none")
+        self.detail = ttk.Treeview(dwrap, columns=("f", "v"), show="headings", selectmode="extended")
         self._hd(self.detail, "f", "Feld")
         self._hd(self.detail, "v", "Wert")
         self.detail.column("f", width=240, anchor="w")
@@ -437,10 +482,10 @@ class App(tk.Tk):
         f3 = ttk.Frame(nb)
         nb.add(f3, text=tr("Fehlerliste"))
         self.err_tab = (nb, f3)
-        cols3 = ("t", "cat", "sa", "pgn", "msg")
+        cols3 = ("t", "cat", "sa", "da", "pgn", "msg")
         self.errtv = ttk.Treeview(f3, columns=cols3, show="headings")
-        for c, title, w in (("t", "Zeit [s]", 80), ("cat", "Kategorie", 130), ("sa", "SA", 45), ("pgn", "PGN", 70),
-                            ("msg", "Details", 700)):
+        for c, title, w in (("t", "Zeit [s]", 80), ("cat", "Kategorie", 130), ("sa", "SA", 45), ("da", "DA", 45),
+                            ("pgn", "PGN", 70), ("msg", "Details", 700)):
             self._hd(self.errtv, c, title)
             self.errtv.column(c, width=w, anchor="w")
         self.errtv.tag_configure("severe", foreground="#c62828")
@@ -451,6 +496,8 @@ class App(tk.Tk):
 
         self.status = ttk.Label(self, relief="sunken", anchor="w")
         self.status.pack(fill="x", side="bottom")
+        for tree in (self.tv, self.tr, self.errtv, self.detail):
+            self._enable_copy(tree)
         self.update_status()
         self.update_errors()
 
@@ -489,6 +536,8 @@ class App(tk.Tk):
         self.hw = None
         self.hw_polls = 0
         self.reset_errors()
+        self.stop_at = None
+        self.stop_msg = ""
         self.running = True
         self.t0 = time.time()
         self.thread = threading.Thread(target=self.reader, daemon=True)
@@ -552,6 +601,7 @@ class App(tk.Tk):
         self.log.clear()
         self.total = 0
         self.fp = FastPacket()
+        self.reset_errors()
 
     def handle_frame(self, t, frame):
         can_id, ext, rtr, d = frame
@@ -560,19 +610,17 @@ class App(tk.Tk):
             return
         prio, pgn, sa, da = split_id(can_id)
         self.total += 1
-        self.log.append((t, can_id, prio, pgn, sa, da, d))
-        if len(self.log) > 500000:
-            del self.log[:100000]
+        self._log_append((t, can_id, prio, pgn, sa, da, d, None))
         name = pg.pgn_name(pgn, None if pg.is_fast_packet(pgn) else d)
         if not self.paused:
             self.tr.insert("", "end", values=(f"{t:.3f}", f"{can_id:08X}", prio, pgn, sa, da, name, d.hex(" ").upper()))
         # Daten der Anwendungsebene
         if pg.is_fast_packet(pgn):
-            full = self.fp.feed(sa, pgn, d)
+            full = self.fp.feed(sa, pgn, d, da)
             for code, info in self.fp.take_errors():
                 if code == "orphan" and t < WARMUP_S:      # beim Verbinden mitten in einer Nachricht ist das normal
                     continue
-                self.add_error(t, "fp", tr(FP_ERRORS[code]).format(**info), sa, pgn)
+                self.add_error(t, "fp", tr(FP_ERRORS[code]).format(**info), sa, pgn, da)
             if full is None:
                 return
         else:
@@ -580,7 +628,7 @@ class App(tk.Tk):
         if pgn == 59392 and len(full) >= 8 and full[0] in (1, 2, 3):      # ISO Acknowledgement: NAK / verweigert / belegt
             what = {1: "NAK", 2: "Zugriff verweigert", 3: "Adresse belegt"}[full[0]]
             self.add_error(t, "nak", tr("{what} für PGN {pgn} (Antwort an Adresse {da})").format(
-                what=tr(what), pgn=int.from_bytes(full[5:8], "little"), da=da), sa, pgn)
+                what=tr(what), pgn=int.from_bytes(full[5:8], "little"), da=da), sa, pgn, da)
         r = self.pgn_rows.get((sa, pgn))
         if r is None:
             iid = self.tv.insert("", "end", values=(sa, pgn, name, 0, "", "", ""))
@@ -632,6 +680,8 @@ class App(tk.Tk):
                 self.tr.delete(*ch[:len(ch) - self.TRACE_MAX])
             if ch:
                 self.tr.see(self.tr.get_children()[-1])
+        if self.stop_at is not None and time.time() >= self.stop_at:
+            self.do_stop()
         if self.err_dirty:
             self.err_dirty = False
             self.update_errors()
@@ -645,23 +695,125 @@ class App(tk.Tk):
         self.after(100, self.tick)
 
     # ----- Fehleranzeige -----
-    def add_error(self, t, cat, text, sa=None, pgn=None):
-        """Fehler zählen und (begrenzt) in die Fehlerliste eintragen."""
+    def add_error(self, t, cat, text, sa=None, pgn=None, da=None):
+        """Fehler zählen, ins Log schreiben, (begrenzt) in die Fehlerliste eintragen und ggf. den Stopp auslösen."""
         self.err[cat] += 1
         now = time.time()
         self.err_last[cat] = now
+        self._log_append((t, None, None, pgn, sa, da, b"", (cat, text)))      # vollständig, ohne Mengenbegrenzung
         if now - self.rate_t >= 1.0:
             self.rate_t, self.rate_n = now, 0
         self.rate_n += 1
-        if self.rate_n <= 20:
+        if self.rate_n <= 20:                               # Fehlerliste nicht fluten, Zähler und Log bleiben exakt
             self.errtv.insert("", "end", values=(f"{t:.3f}", tr(ERR_CATS[cat][0]), "" if sa is None else sa,
-                                                 "" if pgn is None else pgn, text),
+                                                 "" if da is None else da, "" if pgn is None else pgn, text),
                               tags=("severe" if ERR_CATS[cat][1] else "info",))
             ch = self.errtv.get_children()
             if len(ch) > self.ERR_MAX:
                 self.errtv.delete(*ch[:len(ch) - self.ERR_MAX])
             self.errtv.see(ch[-1])
         self.err_dirty = True
+        if self.stop_on_error and self.running and self.stop_at is None and cat in self.trigger_cats:
+            self.arm_stop(t, cat, text)
+
+    def _log_append(self, entry):
+        """Log = Ringpuffer: bei Überlauf fallen die ältesten Einträge weg (Vorlauf bleibt erhalten)."""
+        self.log.append(entry)
+        if len(self.log) > self.log_max:
+            del self.log[:max(1, self.log_max // 5)]
+
+    # ----- Stopp bei Fehler -----
+    def _build_trigger_menu(self):
+        menu = tk.Menu(self.trig_btn, tearoff=0)
+        for key, (label, _severe) in ERR_CATS.items():
+            menu.add_checkbutton(label=tr(label), variable=self.trig_vars[key], command=self.on_trigger_change)
+        self.trig_btn["menu"] = menu
+        self.trig_btn.config(text=tr("Auslöser") + " ▾")
+
+    def on_trigger_change(self):
+        self.stop_on_error = bool(self.stop_var.get())
+        self.trigger_cats = {k for k, v in self.trig_vars.items() if v.get()}
+        try:
+            self.post_s = max(0.0, min(60.0, float(str(self.post_var.get()).replace(",", "."))))
+        except ValueError:
+            pass
+        self.autosave = bool(self.auto_var.get())
+        self.cfg.update(stop_on_error=self.stop_on_error, trigger_cats=sorted(self.trigger_cats),
+                        post_s=self.post_s, autosave=self.autosave)
+        save_config(self.cfg)
+
+    def choose_log_dir(self):
+        d = filedialog.askdirectory(initialdir=self.log_dir if os.path.isdir(self.log_dir) else None, title=tr("Log-Ordner"))
+        if d:
+            self.log_dir = d
+            self.cfg["log_dir"] = d
+            save_config(self.cfg)
+
+    def arm_stop(self, t, cat, text):
+        """Fehler erkannt: nach dem Nachlauf (damit auch die Frames danach im Log sind) wird gestoppt."""
+        self.stop_at = time.time() + self.post_s
+        self.stop_info = (cat, text)
+        self._log_append((t, None, None, None, None, None, b"", ("trigger", "{}: {}".format(tr(ERR_CATS[cat][0]), text))))
+        self.stop_msg = tr("Fehler erkannt – Aufzeichnung stoppt in {s:g} s …").format(s=self.post_s)
+        self.update_status()
+
+    def do_stop(self):
+        cat, text = self.stop_info
+        self.stop_at = None
+        self.disconnect()
+        try:                                        # bereits gelesene, aber noch nicht verarbeitete Frames übernehmen
+            while True:
+                item = self.q.get_nowait()
+                if item[0] == "frame":
+                    self.handle_frame(item[1], item[2])
+        except queue.Empty:
+            pass
+        msg = tr("Aufzeichnung gestoppt nach Fehler ({cat}: {text})").format(cat=tr(ERR_CATS[cat][0]), text=text)
+        if self.autosave:
+            path = os.path.join(self.log_dir, time.strftime("n2k_%Y%m%d_%H%M%S_fehler.csv"))
+            try:
+                self.write_log(path)
+                msg += " – " + tr("Log gespeichert: {path}").format(path=path)
+            except OSError as e:
+                msg += " – " + tr("Log konnte nicht gespeichert werden: {e}").format(e=e)
+        self.stop_msg = msg
+        self.update_status()
+        self.bell()
+        messagebox.showwarning(tr("Aufzeichnung gestoppt"), msg)
+
+    # ----- Kopieren -----
+    def _enable_copy(self, tree):
+        """Strg+C kopiert die markierten Zeilen (Tab-getrennt, mit Kopfzeile), Strg+A markiert alles,
+        Rechtsklick: Kontextmenü. Gelesen wird mit tree.set(): item() würde Werte wie '0010' in Zahlen umwandeln."""
+        def do_copy(all_rows=False):
+            iids = tree.get_children() if all_rows else tree.selection()
+            cols = tree["columns"]
+            lines = ["\t".join(str(tree.heading(c)["text"]) for c in cols)]
+            lines += ["\t".join(str(tree.set(i, c)) for c in cols) for i in iids]
+            self.clipboard_clear()
+            self.clipboard_append("\n".join(lines))
+            self.update()                           # Windows: Zwischenablage auch nach Programmende behalten
+
+        def key_copy(_e):
+            do_copy()
+            return "break"
+
+        def key_all(_e):
+            tree.selection_set(tree.get_children())
+            return "break"
+
+        def popup(e):
+            row = tree.identify_row(e.y)
+            if row and row not in tree.selection():
+                tree.selection_set(row)
+            m = tk.Menu(tree, tearoff=0)
+            m.add_command(label=tr("Kopieren"), command=do_copy)
+            m.add_command(label=tr("Alles kopieren"), command=lambda: do_copy(True))
+            m.tk_popup(e.x_root, e.y_root)
+
+        tree.bind("<Control-c>", key_copy)
+        tree.bind("<Control-a>", key_all)
+        tree.bind("<Button-3>", popup)
 
     def on_hw_status(self, t, rec, tec):
         """Fehlerzähler des CAN-Controllers (Antwort des Adapters auf die Statusabfrage)."""
@@ -683,6 +835,7 @@ class App(tk.Tk):
             self.err[k] = 0
         self.err_last.clear()
         self.errtv.delete(*self.errtv.get_children())
+        self.log = [e for e in self.log if not e[7]]      # Fehlerzeilen aus dem Log entfernen
         if self.hw:
             self.hw["max_rec"], self.hw["max_tec"] = self.hw["rec"], self.hw["tec"]
         self.update_errors()
@@ -761,6 +914,24 @@ class App(tk.Tk):
             messagebox.showinfo(tr("Plugins"), tr("{n} Plugin(s) geladen.\n(Entfernte Plugins wirken erst nach einem Neustart.)")
                                 .format(n=len(self.plugin_res)))
 
+    def write_log(self, path):
+        """Alle Frames und Fehlerereignisse in zeitlicher Reihenfolge als CSV. Fehlerzeilen haben Text in der
+        Spalte 'Fehler' (Kategorie: Text); die Zeile 'Auslöser' markiert den automatischen Stopp."""
+        nf = ne = 0
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        with open(path, "w", newline="", encoding="utf-8") as f:
+            w = csv.writer(f, delimiter=";")
+            w.writerow([tr(h) for h in ("Zeit_s", "CAN_ID", "Prio", "PGN", "SA", "DA", "Name", "Daten_hex", "Fehler")])
+            for t, cid, prio, pgn, sa, da, d, err in self.log:
+                if err:
+                    ne += 1
+                    w.writerow([f"{t:.4f}", "", "", "" if pgn is None else pgn, "" if sa is None else sa,
+                                "" if da is None else da, "", "", "{}: {}".format(tr(CAT_LABELS[err[0]]), err[1])])
+                else:
+                    nf += 1
+                    w.writerow([f"{t:.4f}", f"{cid:08X}", prio, pgn, sa, da, pg.pgn_name(pgn, d), d.hex(" ").upper(), ""])
+        return nf, ne
+
     def save_log(self):
         if not self.log:
             messagebox.showinfo(tr("Log"), tr("Noch keine Daten."))
@@ -769,12 +940,34 @@ class App(tk.Tk):
                                           initialfile=time.strftime("n2k_%Y%m%d_%H%M%S.csv"))
         if not fn:
             return
-        with open(fn, "w", newline="", encoding="utf-8") as f:
-            w = csv.writer(f, delimiter=";")
-            w.writerow([tr(h) for h in ("Zeit_s", "CAN_ID", "Prio", "PGN", "SA", "DA", "Name", "Daten_hex")])
-            for t, cid, prio, pgn, sa, da, d in self.log:
-                w.writerow([f"{t:.4f}", f"{cid:08X}", prio, pgn, sa, da, pg.pgn_name(pgn, d), d.hex(" ").upper()])
-        messagebox.showinfo(tr("Log"), tr("{n} Frames gespeichert.").format(n=len(self.log)))
+        try:
+            nf, ne = self.write_log(fn)
+        except OSError as e:
+            messagebox.showerror(tr("Fehler"), str(e))
+            return
+        messagebox.showinfo(tr("Log"), tr("{f} Frames und {e} Fehlerereignisse gespeichert.").format(f=nf, e=ne))
+
+    def save_errors(self):
+        """Nur die Fehlerereignisse (vollständig, auch die nicht in der Liste angezeigten) als CSV."""
+        rows = [e for e in self.log if e[7]]
+        if not rows:
+            messagebox.showinfo(tr("Fehler"), tr("Keine Fehler vorhanden."))
+            return
+        fn = filedialog.asksaveasfilename(defaultextension=".csv", filetypes=[("CSV", "*.csv")],
+                                          initialfile=time.strftime("n2k_%Y%m%d_%H%M%S_fehlerliste.csv"))
+        if not fn:
+            return
+        try:
+            with open(fn, "w", newline="", encoding="utf-8") as f:
+                w = csv.writer(f, delimiter=";")
+                w.writerow([tr(h) for h in ("Zeit_s", "Kategorie", "SA", "DA", "PGN", "Details")])
+                for t, _c, _p, pgn, sa, da, _d, err in rows:
+                    w.writerow([f"{t:.4f}", tr(CAT_LABELS[err[0]]), "" if sa is None else sa, "" if da is None else da,
+                                "" if pgn is None else pgn, err[1]])
+        except OSError as e:
+            messagebox.showerror(tr("Fehler"), str(e))
+            return
+        messagebox.showinfo(tr("Fehler"), tr("{n} Fehler gespeichert.").format(n=len(rows)))
 
     def on_close(self):
         save_config(self.cfg)
