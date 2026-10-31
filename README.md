@@ -17,6 +17,10 @@ COM-Port wählen, Bitrate 250 kbit/s (NMEA2000-Standard), Modus „Nur Lauschen�
 - **PGN-Übersicht:** pro Quelladresse und PGN eine Zeile mit Anzahl, Hz, Rohdaten und dekodiertem Text.
   Zeile anklicken → unten alle Felder einzeln, live aktualisiert.
 - **Trace:** alle Frames mit Zeitstempel, CAN-ID, Priorität, PGN, SA, DA.
+- **Doppelklick im Trace** öffnet ein Fenster mit den dekodierten Feldern genau dieser Nachricht (Zeit, CAN-ID, PGN,
+  alle Felder). Bei Fast-Packet-PGNs wird die Nachricht aus den Frames im Log zusammengesetzt, zu der der Frame gehört
+  (auch bei verschachtelten Nachrichten); ist sie im Log unvollständig, steht ein Hinweis. Funktioniert live und bei
+  geladenen Logs; das Fenster wird beim nächsten Doppelklick wiederverwendet, Strg+C kopiert.
 - **Fast-Packet** wird zusammengesetzt (z. B. 129029, 126996).
 - **Log-Export** als CSV (Spalten `PC_Zeit;Zeit_s;CAN_ID;Prio;PGN;SA;DA;Name;Daten_hex;Fehler`). `PC_Zeit` ist die
   Uhrzeit des PC (lokal, Mikrosekunden), `Zeit_s` die Zeit seit dem Verbinden. Der Adapter liefert selbst keine
