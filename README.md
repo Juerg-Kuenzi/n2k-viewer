@@ -18,7 +18,10 @@ COM-Port wählen, Bitrate 250 kbit/s (NMEA2000-Standard), Modus „Nur Lauschen�
   Zeile anklicken → unten alle Felder einzeln, live aktualisiert.
 - **Trace:** alle Frames mit Zeitstempel, CAN-ID, Priorität, PGN, SA, DA.
 - **Fast-Packet** wird zusammengesetzt (z. B. 129029, 126996).
-- **Log-Export** als CSV.
+- **Log-Export** als CSV (Spalten `Zeit_s;CAN_ID;Prio;PGN;SA;DA;Name;Daten_hex;Fehler`). Fehler stehen als eigene Zeilen
+  an der Stelle im Log, an der sie auftraten (Spalte `Fehler` = „Kategorie: Text“).
+- **Kopieren:** in allen Tabellen Zeilen markieren, `Strg+C` (mit Kopfzeile, tabulatorgetrennt, direkt in Excel einfügbar),
+  `Strg+A` = alles, Rechtsklick → „Kopieren“ / „Alles kopieren“.
 
 ## Dateien
 
@@ -71,6 +74,20 @@ Grenzen:
   dokumentiert; meldet der Adapter nichts, steht „Adapter meldet keine Zähler“. Mit `"poll_status": false` in
   `n2k-viewer.json` lässt sich die Abfrage abschalten (`"status_interval"` = Abstand in Sekunden, Standard 0.25).
 - In den ersten 2 s nach dem Verbinden werden angeschnittene Nachrichten nicht als Fehler gezählt.
+
+### Fehler aufzeichnen und bei Fehler stoppen
+
+- **Fehler speichern (CSV):** exportiert die Fehlerliste (`Zeit_s;Kategorie;SA;DA;PGN;Details`).
+- **Bei Fehler stoppen:** nach dem ersten Fehler einer gewählten Kategorie („Auslöser ▾“) läuft die Aufzeichnung noch
+  **Nachlauf [s]** weiter (Standard 2 s, damit auch die Frames *nach* dem Fehler im Log sind) und stoppt dann. Das Log wird
+  bei aktivem „Log bei Stopp automatisch speichern“ als `n2k_<Datum>_<Zeit>_fehler.csv` im **Log-Ordner** abgelegt.
+  Die Auslösezeile steht im Log mit Kategorie „Auslöser“. Standard-Auslöser: CAN, Fast-Packet, seriell, Frame-Format
+  (ISO-NAK löst nicht aus).
+- Das Log ist ein Ringpuffer (`log_max`, Standard 500000 Frames), der Viewer kann also lange laufen und behält die letzten
+  Frames vor dem Fehler.
+- Einstellungen in `n2k-viewer.json`: `stop_on_error`, `trigger_cats`, `post_s`, `autosave`, `log_dir`, `log_max`.
+- Fast-Packet-Nachrichten werden pro Quelle, Ziel **und** PGN zusammengesetzt; gleichzeitige adressierte Nachrichten
+  (z. B. PGN 126720) werden so nicht mehr vermischt.
 
 ## Sprachen / Languages
 
