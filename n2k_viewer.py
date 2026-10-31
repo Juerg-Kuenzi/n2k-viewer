@@ -25,6 +25,9 @@ import n2k_pgns as pg
 from i18n import t as tr          # tr(): Text in die gewählte Sprache übersetzen (siehe i18n.py)
 
 # Einstellungen (Sprache, Port, Bitrate, Modus): %APPDATA%\n2k-viewer.json bzw. ~/n2k-viewer.json
+# Version = Name des GitHub-Releases (Tag). Vor jedem neuen Release hier anpassen.
+VERSION = "V0.2"
+
 CONFIG_FILE = os.path.join(os.environ.get("APPDATA") or os.path.expanduser("~"), "n2k-viewer.json")
 
 
@@ -262,7 +265,7 @@ class App(tk.Tk):
         i18n.set_language(self.cfg.get("language") or i18n.detect_language())
         self._tx_items = []           # übersetzbare Widget-Texte (für die Live-Umschaltung)
         self.fps = 0.0
-        self.title(tr("NMEA2000 Viewer – Seeed USB-CAN Analyzer"))
+        self.title("{} {} – {}".format(tr("NMEA2000 Viewer"), VERSION, tr("Seeed USB-CAN Analyzer")))
         self.geometry("1250x700")
         self.ser = None
         self.thread = None
@@ -331,7 +334,7 @@ class App(tk.Tk):
         self._tx_items.append(("tab", nb, frame, src))
 
     def apply_language(self):
-        self.title(tr("NMEA2000 Viewer – Seeed USB-CAN Analyzer"))
+        self.title("{} {} – {}".format(tr("NMEA2000 Viewer"), VERSION, tr("Seeed USB-CAN Analyzer")))
         for kind, w, a, b in self._tx_items:
             if kind == "opt":
                 w.config(**{b: tr(a)})
@@ -367,6 +370,7 @@ class App(tk.Tk):
             p=sum(1 for _f, e in self.plugin_res if not e))
         if self.stop_msg:
             text += " | " + self.stop_msg
+        text += " | " + VERSION
         self.status.config(text=text)
 
     def _build(self):
