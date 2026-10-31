@@ -120,6 +120,12 @@ Plugins können eigene Texte mit `add_translations("en", {...})` übersetzen (Be
 - „Nur Lauschen“ sendet den Moduscode 0x02 (Silent) laut Seeed-/Copperhill-Protokoll; die Waveshare-Dokumentation
   nennt für Silent 0x01. Kommen im Lauschmodus keine Frames an, „Normal“ probieren (der Viewer sendet auch dort nichts).
 
+## Version und Releases
+
+Die Version steht im Fenstertitel und rechts in der Statuszeile. Sie ist die Konstante `VERSION` am Anfang von
+`n2k_viewer.py` und entspricht dem Namen des GitHub-Releases (z. B. `V0.2`). Ablauf für ein neues Release:
+`VERSION` anpassen → Pull Request mergen → auf GitHub ein Release mit genau diesem Namen als Tag erstellen.
+
 ## Lizenz
 
 MIT – siehe [LICENSE](LICENSE).
