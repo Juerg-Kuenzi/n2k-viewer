@@ -21,7 +21,11 @@ COM-Port wählen, Bitrate 250 kbit/s (NMEA2000-Standard), Modus „Nur Lauschen�
 - **Log-Export** als CSV (Spalten `PC_Zeit;Zeit_s;CAN_ID;Prio;PGN;SA;DA;Name;Daten_hex;Fehler`). `PC_Zeit` ist die
   Uhrzeit des PC (lokal, Mikrosekunden), `Zeit_s` die Zeit seit dem Verbinden. Der Adapter liefert selbst keine
   Zeitstempel: beide Zeiten stammen vom PC und entsprechen dem Moment, in dem der Datenblock aus dem USB-Treiber
-  gelesen wurde. Frames desselben Blocks (oft 200–300 Stück) haben deshalb denselben Zeitstempel. Fehler stehen als eigene Zeilen
+  gelesen wurde. Ohne Korrektur hätten alle Frames
+  eines Blocks (oft 200–300 Stück) denselben Zeitstempel. Der Viewer **schätzt** deshalb die Zeit jedes Frames: Er verteilt
+  die Frames eines Blocks nach ihrer Byte-Position gleichmässig über die Zeit seit dem letzten Block (höchstens 1 s). Das ist
+  eine Schätzung, keine Messung: sie stimmt bei gleichmässiger Buslast, bei Bursts kann ein Frame um bis zu eine Blocklänge
+  (~0,5 s) abweichen. Die Reihenfolge der Frames bleibt immer exakt. Abschaltbar unter „Einstellungen…“ (`interp_time`). Fehler stehen als eigene Zeilen
   an der Stelle im Log, an der sie auftraten (Spalte `Fehler` = „Kategorie: Text“).
 - **Kopieren:** in allen Tabellen Zeilen markieren, `Strg+C` (mit Kopfzeile, tabulatorgetrennt, direkt in Excel einfügbar),
   `Strg+A` = alles, Rechtsklick → „Kopieren“ / „Alles kopieren“.
