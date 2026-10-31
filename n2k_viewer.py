@@ -187,8 +187,10 @@ def split_id(can_id):
 class FastPacket:
     """Setzt Fast-Packet-Nachrichten zusammen und meldet Fehler (Abholen mit take_errors()).
     Eine gestörte Nachricht wird nur einmal gemeldet, nicht einmal pro Folgeframe.
-    Zusammengesetzt wird getrennt je (Absender, Ziel, PGN): bei adressierten PGNs (z. B. 126720, 126208) steht die
-    Zieladresse in der CAN-ID, und ein Gerät kann gleichzeitig an mehrere Ziele senden."""
+    Zusammengesetzt wird getrennt je (Absender, Ziel, PGN, Sequenznummer): bei adressierten PGNs (z. B. 126720, 126208)
+    steht die Zieladresse in der CAN-ID, und ein Gerät kann gleichzeitig an mehrere Ziele senden. Manche Geräte
+    (z. B. Raymarine, PGN 126720) verschachteln sogar zwei Nachrichten mit verschiedener Sequenznummer an dasselbe
+    Ziel; die Sequenznummer trennt diese Nachrichten."""
 
     def __init__(self):
         self.state = {}
@@ -208,9 +210,9 @@ class FastPacket:
         """Gibt komplette Daten zurück oder None."""
         if not d:
             return None
-        key = (sa, da, pgn)
         fc = d[0] & 0x1F
         seq = d[0] >> 5
+        key = (sa, da, pgn, seq)
         if fc == 0:
             if len(d) < 2:
                 return None
